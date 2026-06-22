@@ -5,12 +5,11 @@ import makeWASocket, {
   DisconnectReason,
   type WAMessage,
 } from "@whiskeysockets/baileys";
-import qrcode from "qrcode-terminal";
 import pino from "pino";
 import { config } from "./config.js";
 import { runClaude } from "./claude.js";
-
-const log = pino({ level: "info", transport: undefined });
+import { log } from "./logger.js";
+import { showQr } from "./qr.js";
 
 /** Per-chat conversation state: the Claude session to resume + working dir. */
 interface ChatState {
@@ -19,6 +18,42 @@ interface ChatState {
   busy: boolean;
 }
 const chats = new Map<string, ChatState>();
+
+/** JID of the dedicated "Claude Chat" group, once found or created. */
+let claudeGroupJid: string | undefined;
+
+/**
+ * Find an existing group with the configured name, or create a fresh one so
+ * the user gets a clean, dedicated chat thread for talking to Claude (instead
+ * of cluttering their note-to-self). Falls back silently to note-to-self if
+ * group creation isn't possible.
+ */
+async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void> {
+  if (!config.createGroup) return;
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const existing = Object.values(groups).find((g) => g.subject === config.groupName);
+    if (existing) {
+      claudeGroupJid = existing.id;
+      log.info(`Using existing "${config.groupName}" group (${existing.id})`);
+    } else {
+      const res = await sock.groupCreate(config.groupName, []);
+      claudeGroupJid = res.id;
+      log.info(`Created "${config.groupName}" group (${res.id})`);
+    }
+    await sock.sendMessage(claudeGroupJid, {
+      text:
+        `👋 *Claude Chat* is live.\n\n` +
+        `Send me any task and I'll run it with Claude Code in:\n${config.workdir}\n\n` +
+        `Control: /new  ·  /cd <path>  ·  /status`,
+    });
+  } catch (e: any) {
+    log.warn(
+      `Could not set up "${config.groupName}" group: ${e?.message ?? e}. ` +
+        `Falling back to note-to-self.`,
+    );
+  }
+}
 
 function getChat(jid: string): ChatState {
   let c = chats.get(jid);
@@ -65,23 +100,19 @@ async function start() {
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) {
-      console.log("\nScan this QR with WhatsApp (Settings → Linked Devices → Link a Device):\n");
-      qrcode.generate(qr, { small: true });
-    }
+    if (qr) void showQr(qr);
     if (connection === "open") {
       const me = jidNormalizedUser(sock.user?.id ?? "");
-      log.info(`Connected as ${me}`);
-      console.log(
-        `\n✅ Bridge live. Working dir: ${config.workdir}\n` +
-          (config.allowedJids.length
-            ? `   Allowed senders: ${config.allowedJids.join(", ")}\n`
-            : `   Command channel: note-to-self (message YOURSELF in WhatsApp)\n`) +
-          (config.commandPrefix
-            ? `   Command prefix: "${config.commandPrefix}"\n`
-            : "") +
-          `\nSend a message to start. Control commands: /new  /cd <path>  /status\n`,
+      log.info(`✅ Bridge live. Connected as ${me}`);
+      log.info(`Working dir: ${config.workdir}`);
+      log.info(
+        config.allowedJids.length
+          ? `Allowed senders: ${config.allowedJids.join(", ")}`
+          : `Command channel: note-to-self (message YOURSELF in WhatsApp)`,
       );
+      if (config.commandPrefix) log.info(`Command prefix: "${config.commandPrefix}"`);
+      log.info("Ready. Control commands: /new  /cd <path>  /status");
+      void ensureGroup(sock);
     }
     if (connection === "close") {
       const code = (lastDisconnect?.error as any)?.output?.statusCode;
@@ -100,12 +131,15 @@ async function start() {
       if (!remoteJid) continue;
 
       // ── Authorization ──────────────────────────────────────────
-      // Default (no allowlist): only note-to-self messages (fromMe AND the
-      // chat is your own jid). With an allowlist: messages from those jids.
-      const isSelfChat = Boolean(msg.key.fromMe) && jidNormalizedUser(remoteJid) === me;
+      // Default (no allowlist): only messages YOU send (fromMe) in either the
+      // dedicated "Claude Chat" group or your note-to-self chat. With an
+      // explicit allowlist: any message from those jids.
+      const fromMe = Boolean(msg.key.fromMe);
+      const isClaudeGroup = claudeGroupJid !== undefined && remoteJid === claudeGroupJid;
+      const isSelfChat = fromMe && jidNormalizedUser(remoteJid) === me;
       const isAllowed = config.allowedJids.length
         ? config.allowedJids.includes(jidNormalizedUser(remoteJid))
-        : isSelfChat;
+        : fromMe && (isClaudeGroup || isSelfChat);
       if (!isAllowed) continue;
 
       const raw = extractText(msg)?.trim();
@@ -162,6 +196,8 @@ async function start() {
       chat.busy = true;
       await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
       await reply("🤖 On it...");
+      const startedAt = Date.now();
+      log.info(`[${remoteJid}] task in ${chat.cwd}: ${body.replace(/\s+/g, " ").slice(0, 200)}`);
 
       try {
         const res = await runClaude(body, {
@@ -169,9 +205,15 @@ async function start() {
           resumeSessionId: chat.sessionId,
         });
         if (res.sessionId) chat.sessionId = res.sessionId;
+        const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
+        log.info(
+          `[${remoteJid}] ${res.isError ? "error" : "done"} in ${secs}s` +
+            (res.costUsd ? ` ($${res.costUsd.toFixed(4)})` : ""),
+        );
         const prefix = res.isError ? "⚠️ " : "";
         await reply(prefix + res.text);
       } catch (e: any) {
+        log.error(`[${remoteJid}] bridge error: ${e?.message ?? e}`);
         await reply(`💥 Bridge error: ${e?.message ?? e}`);
       } finally {
         chat.busy = false;
@@ -182,6 +224,6 @@ async function start() {
 }
 
 start().catch((e) => {
-  console.error("Fatal:", e);
+  log.error("Fatal:", e?.message ?? String(e));
   process.exit(1);
 });

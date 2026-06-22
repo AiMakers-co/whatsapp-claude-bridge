@@ -1,6 +1,8 @@
 # Secrets & WhatsApp session — NEVER commit these
 .env
 auth/
+logs/
+qr.png
 *.log
 
 # Dependencies & build
