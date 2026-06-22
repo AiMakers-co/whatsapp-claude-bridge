@@ -17,8 +17,11 @@ A small TypeScript daemon that:
 4. Sends Claude's result back over WhatsApp. Conversation continuity is preserved
    per chat by threading the returned `session_id` into `--resume`.
 
-Architecture is three files in `src/`: `config.ts` (env), `claude.ts` (spawns the
-CLI), `index.ts` (WhatsApp socket, auth, routing, control commands).
+Architecture in `src/`: `config.ts` (env), `providers.ts` (provider-agnostic
+agent layer — claude/codex/gemini/grok specs + a generic CLI runner),
+`index.ts` (WhatsApp socket, auth, routing, control commands), plus `logger.ts`
+and `qr.ts`. The default provider is `claude`; change with `PROVIDER` in `.env`
+or `/use <name>` per chat.
 
 ## Setup procedure — do this in order
 
@@ -55,9 +58,10 @@ CLI), `index.ts` (WhatsApp socket, auth, routing, control commands).
 ## How the user drives it once live
 
 - Any normal message = a task for Claude, run in `WORKDIR`.
-- `/new` — start a fresh Claude session (drops conversation memory).
+- `/new` — start a fresh session (drops conversation memory).
 - `/cd <path>` — switch the working directory for this chat (resets the session).
-- `/status` — show current dir, session id, and whether a task is running.
+- `/use <provider>` — switch agent CLI (claude/codex/gemini/grok) for this chat.
+- `/status` — show provider, current dir, session id, and whether a task is running.
 - One task runs at a time per chat; a second message while busy is rejected with a
   nudge rather than queued.
 

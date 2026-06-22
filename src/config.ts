@@ -23,8 +23,11 @@ export const config = {
   /** Optional prefix that must lead a message for it to count as a task. */
   commandPrefix: process.env.COMMAND_PREFIX?.trim() || "",
 
-  /** Optional model override for `claude --model`. */
-  model: process.env.CLAUDE_MODEL?.trim() || "",
+  /** Which agent CLI to drive: claude | codex | gemini | grok. */
+  provider: process.env.PROVIDER?.trim().toLowerCase() || "claude",
+
+  /** Optional model override passed to the selected provider. */
+  model: process.env.MODEL?.trim() || process.env.CLAUDE_MODEL?.trim() || "",
 
   /** Hard timeout per task in milliseconds. */
   taskTimeoutMs:

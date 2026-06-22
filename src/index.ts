@@ -7,15 +7,16 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import { config } from "./config.js";
-import { runClaude, checkClaudeCli } from "./claude.js";
+import { getProvider, providerNames } from "./providers.js";
 import { log } from "./logger.js";
 import { showQr } from "./qr.js";
 
-/** Per-chat conversation state: the Claude session to resume + working dir. */
+/** Per-chat conversation state: provider, session to resume, working dir. */
 interface ChatState {
   sessionId?: string;
   cwd: string;
   busy: boolean;
+  provider: string;
 }
 const chats = new Map<string, ChatState>();
 
@@ -58,7 +59,7 @@ async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void>
 function getChat(jid: string): ChatState {
   let c = chats.get(jid);
   if (!c) {
-    c = { cwd: config.workdir, busy: false };
+    c = { cwd: config.workdir, busy: false, provider: config.provider };
     chats.set(jid, c);
   }
   return c;
@@ -86,13 +87,19 @@ function chunk(text: string, size = 4000): string[] {
 }
 
 async function start() {
-  const claudeVersion = checkClaudeCli();
-  if (claudeVersion) {
-    log.info(`Claude CLI detected: ${claudeVersion}`);
+  const selected = getProvider(config.provider);
+  if (!selected) {
+    log.error(
+      `Unknown PROVIDER "${config.provider}". Valid: ${providerNames().join(", ")}.`,
+    );
+    process.exit(1);
+  }
+  if (selected.available()) {
+    log.info(`Provider: ${selected.name} (\`${selected.bin}\` found)`);
   } else {
     log.warn(
-      "⚠ `claude` CLI not found on PATH. Tasks will fail until Claude Code is " +
-        "installed and logged in (run `claude` once to authenticate).",
+      `⚠ Provider "${selected.name}" selected but \`${selected.bin}\` is not on PATH. ` +
+        `Tasks will fail until it's installed and authenticated.`,
     );
   }
 
@@ -179,7 +186,7 @@ async function start() {
         const arg = rest.join(" ").trim();
         if (cmd === "new") {
           chat.sessionId = undefined;
-          await reply("🆕 Started a fresh Claude session.");
+          await reply("🆕 Started a fresh session.");
         } else if (cmd === "cd") {
           if (arg) {
             chat.cwd = arg;
@@ -188,12 +195,32 @@ async function start() {
           } else {
             await reply(`📁 Current working dir:\n${chat.cwd}`);
           }
+        } else if (cmd === "use") {
+          const name = arg.toLowerCase();
+          const next = getProvider(name);
+          if (!next) {
+            const list = providerNames()
+              .map((n) => {
+                const p = getProvider(n)!;
+                return `• ${n}${p.available() ? "" : " (not installed)"} — ${p.blurb}`;
+              })
+              .join("\n");
+            await reply(`Pick a provider: /use <name>\n\n${list}`);
+          } else {
+            chat.provider = name;
+            chat.sessionId = undefined;
+            await reply(
+              `🔁 Switched to *${name}*${next.available() ? "" : " — ⚠ not installed on this machine"}.\n` +
+                `(session reset)`,
+            );
+          }
         } else if (cmd === "status") {
           await reply(
-            `📊 Status\nDir: ${chat.cwd}\nSession: ${chat.sessionId ?? "none (fresh)"}\nBusy: ${chat.busy}`,
+            `📊 Status\nProvider: ${chat.provider}\nDir: ${chat.cwd}\n` +
+              `Session: ${chat.sessionId ?? "none (fresh)"}\nBusy: ${chat.busy}`,
           );
         } else {
-          await reply("Unknown command. Available: /new  /cd <path>  /status");
+          await reply("Unknown command. Available: /new  /cd <path>  /use <provider>  /status");
         }
         continue;
       }
@@ -203,21 +230,27 @@ async function start() {
         await reply("⏳ Still working on the previous task — send it again once I reply.");
         continue;
       }
+      const provider = getProvider(chat.provider);
+      if (!provider) {
+        await reply(`⚠️ Unknown provider "${chat.provider}". Use /use <name> to pick one.`);
+        continue;
+      }
       chat.busy = true;
       await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
       await reply("🤖 On it...");
       const startedAt = Date.now();
-      log.info(`[${remoteJid}] task in ${chat.cwd}: ${body.replace(/\s+/g, " ").slice(0, 200)}`);
+      log.info(`[${remoteJid}] (${provider.name}) task in ${chat.cwd}: ${body.replace(/\s+/g, " ").slice(0, 200)}`);
 
       try {
-        const res = await runClaude(body, {
-          cwd: chat.cwd,
-          resumeSessionId: chat.sessionId,
-        });
+        const res = await provider.run(
+          body,
+          { cwd: chat.cwd, resumeSessionId: chat.sessionId, model: config.model || undefined },
+          config.taskTimeoutMs,
+        );
         if (res.sessionId) chat.sessionId = res.sessionId;
         const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
         log.info(
-          `[${remoteJid}] ${res.isError ? "error" : "done"} in ${secs}s` +
+          `[${remoteJid}] (${provider.name}) ${res.isError ? "error" : "done"} in ${secs}s` +
             (res.costUsd ? ` ($${res.costUsd.toFixed(4)})` : ""),
         );
         const prefix = res.isError ? "⚠️ " : "";

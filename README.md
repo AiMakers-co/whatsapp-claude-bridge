@@ -62,13 +62,30 @@ is the one step only a human can do — it links your WhatsApp account, by desig
 | `CLAUDE_MODEL` | Optional `--model` override. Empty = account default. |
 | `TASK_TIMEOUT_SECONDS` | Kill a task after this long. Default `600`. |
 
+## Provider-agnostic
+
+The bridge drives any **agentic coding CLI** — not just Claude. Pick one with
+`PROVIDER` in `.env`, or switch per-chat from WhatsApp with `/use <name>`:
+
+| Provider | CLI | Session continuity | Notes |
+| --- | --- | --- | --- |
+| `claude` *(default)* | `claude` | ✅ full | + cost reporting |
+| `codex` | `codex` | ✅ resumable | run `codex login` first |
+| `gemini` | `gemini` | ❌ stateless | one-shot per message |
+| `grok` | `grok` | ❌ stateless | flags best-effort |
+
+Each must be installed and authenticated. Only `claude`/`codex` expose a
+resumable session id; for `gemini`/`grok`, every message is fresh. Adding a new
+provider is a ~10-line spec in [`src/providers.ts`](./src/providers.ts).
+
 ## Control commands
 
 | Message | Effect |
 | --- | --- |
-| `/new` | Start a fresh Claude session (drop memory). |
+| `/new` | Start a fresh session (drop memory). |
 | `/cd <path>` | Switch working directory for this chat. |
-| `/status` | Show current dir, session id, busy state. |
+| `/use <provider>` | Switch agent CLI (claude/codex/gemini/grok) for this chat. |
+| `/status` | Show provider, current dir, session id, busy state. |
 
 ## Run it 24/7
 
