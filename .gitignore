@@ -1,0 +1,11 @@
+# Secrets & WhatsApp session — NEVER commit these
+.env
+auth/
+*.log
+
+# Dependencies & build
+node_modules/
+dist/
+
+# OS
+.DS_Store
