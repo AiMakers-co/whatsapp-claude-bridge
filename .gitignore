@@ -5,6 +5,10 @@ logs/
 qr.png
 *.log
 
+# WhatsApp media staging (only relevant if WORKDIR is this repo)
+inbox/
+outbox/
+
 # Dependencies & build
 node_modules/
 dist/

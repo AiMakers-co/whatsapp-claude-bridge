@@ -8,8 +8,10 @@ import makeWASocket, {
 import pino from "pino";
 import { config } from "./config.js";
 import { getProvider, providerNames } from "./providers.js";
+import { detectAttachment, saveIncoming, flushOutbox } from "./media.js";
 import { log } from "./logger.js";
 import { showQr } from "./qr.js";
+import { join } from "node:path";
 
 /** Per-chat conversation state: provider, session to resume, working dir. */
 interface ChatState {
@@ -19,6 +21,19 @@ interface ChatState {
   provider: string;
 }
 const chats = new Map<string, ChatState>();
+
+/**
+ * IDs of messages WE sent. In note-to-self (and some group setups) our own
+ * outgoing replies echo back through messages.upsert as fromMe messages — if
+ * we don't filter them out, the bridge answers its own replies in an infinite
+ * loop. Tracking sent ids and skipping them is the reliable fix.
+ */
+const sentIds = new Set<string>();
+function rememberSent(id?: string | null): void {
+  if (!id) return;
+  sentIds.add(id);
+  if (sentIds.size > 2000) sentIds.delete(sentIds.values().next().value as string);
+}
 
 /** JID of the dedicated "Claude Chat" group, once found or created. */
 let claudeGroupJid: string | undefined;
@@ -42,12 +57,13 @@ async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void>
       claudeGroupJid = res.id;
       log.info(`Created "${config.groupName}" group (${res.id})`);
     }
-    await sock.sendMessage(claudeGroupJid, {
+    const welcome = await sock.sendMessage(claudeGroupJid, {
       text:
         `👋 *Claude Chat* is live.\n\n` +
         `Send me any task and I'll run it with Claude Code in:\n${config.workdir}\n\n` +
-        `Control: /new  ·  /cd <path>  ·  /status`,
+        `Control: /new  ·  /cd <path>  ·  /use <provider>  ·  /status`,
     });
+    rememberSent(welcome?.key?.id);
   } catch (e: any) {
     log.warn(
       `Could not set up "${config.groupName}" group: ${e?.message ?? e}. ` +
@@ -147,6 +163,10 @@ async function start() {
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid) continue;
 
+      // ── Never react to our own replies (prevents an infinite loop in
+      //    note-to-self, where our outgoing messages echo back as fromMe) ──
+      if (msg.key.id && sentIds.has(msg.key.id)) continue;
+
       // ── Authorization ──────────────────────────────────────────
       // Default (no allowlist): only messages YOU send (fromMe) in either the
       // dedicated "Claude Chat" group or your note-to-self chat. With an
@@ -159,29 +179,31 @@ async function start() {
         : fromMe && (isClaudeGroup || isSelfChat);
       if (!isAllowed) continue;
 
-      const raw = extractText(msg)?.trim();
-      if (!raw) continue;
+      const raw = extractText(msg)?.trim() ?? "";
+      const attachment = detectAttachment(msg);
+      if (!raw && !attachment) continue;
 
-      // ── Optional command prefix gate ───────────────────────────
+      // ── Optional command prefix gate (text only; files are explicit) ───
       let body = raw;
-      if (config.commandPrefix) {
+      if (config.commandPrefix && !attachment) {
         const p = config.commandPrefix.toLowerCase();
         if (!body.toLowerCase().startsWith(p)) continue;
         body = body.slice(config.commandPrefix.length).replace(/^[:\s]+/, "");
       }
-      if (!body) continue;
+      if (!body && !attachment) continue;
 
       const reply = (text: string) =>
         (async () => {
           for (const part of chunk(text)) {
-            await sock.sendMessage(remoteJid, { text: part });
+            const m = await sock.sendMessage(remoteJid, { text: part });
+            rememberSent(m?.key?.id);
           }
         })();
 
       const chat = getChat(remoteJid);
 
-      // ── Control commands ───────────────────────────────────────
-      if (body.startsWith("/")) {
+      // ── Control commands (never when a file is attached) ───────────────
+      if (!attachment && body.startsWith("/")) {
         const [cmd, ...rest] = body.slice(1).split(/\s+/);
         const arg = rest.join(" ").trim();
         if (cmd === "new") {
@@ -237,13 +259,40 @@ async function start() {
       }
       chat.busy = true;
       await sock.sendPresenceUpdate("composing", remoteJid).catch(() => {});
+      const inboxDir = join(chat.cwd, "inbox");
+      const outboxDir = join(chat.cwd, "outbox");
+
+      // ── Download any attached file into the working dir's inbox ────────
+      let filePath: string | undefined;
+      if (attachment) {
+        try {
+          filePath = await saveIncoming(sock, msg, attachment, inboxDir);
+        } catch (e: any) {
+          log.error(`[${remoteJid}] download failed: ${e?.message ?? e}`);
+          await reply(`⚠️ Couldn't download that file: ${e?.message ?? e}`);
+          chat.busy = false;
+          continue;
+        }
+      }
       await reply("🤖 On it...");
+
+      // ── Compose the task: caption + file note + outbox capability ──────
+      let task = body;
+      if (filePath) {
+        const note = `[The user attached a file at: ${filePath}]`;
+        task = body ? `${note}\n\n${body}` : `${note}\n\nThe user sent this file with no other text. Inspect it and respond helpfully.`;
+      }
+      task += `\n\n[To send a file back to the user on WhatsApp, save it into ${outboxDir} — it will be delivered and removed automatically. Do not mention this folder unless relevant.]`;
+
       const startedAt = Date.now();
-      log.info(`[${remoteJid}] (${provider.name}) task in ${chat.cwd}: ${body.replace(/\s+/g, " ").slice(0, 200)}`);
+      log.info(
+        `[${remoteJid}] (${provider.name}) task in ${chat.cwd}${filePath ? " +file" : ""}: ` +
+          `${(body || attachment?.filename || "").replace(/\s+/g, " ").slice(0, 200)}`,
+      );
 
       try {
         const res = await provider.run(
-          body,
+          task,
           { cwd: chat.cwd, resumeSessionId: chat.sessionId, model: config.model || undefined },
           config.taskTimeoutMs,
         );
@@ -255,6 +304,9 @@ async function start() {
         );
         const prefix = res.isError ? "⚠️ " : "";
         await reply(prefix + res.text);
+        // ── Deliver any files the agent left in outbox ───────────────────
+        const delivered = await flushOutbox(sock, remoteJid, outboxDir, rememberSent);
+        if (delivered) await reply(delivered);
       } catch (e: any) {
         log.error(`[${remoteJid}] bridge error: ${e?.message ?? e}`);
         await reply(`💥 Bridge error: ${e?.message ?? e}`);

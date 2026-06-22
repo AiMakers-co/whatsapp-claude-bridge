@@ -78,6 +78,23 @@ Each must be installed and authenticated. Only `claude`/`codex` expose a
 resumable session id; for `gemini`/`grok`, every message is fresh. Adding a new
 provider is a ~10-line spec in [`src/providers.ts`](./src/providers.ts).
 
+## Files
+
+You can send and receive files, not just text.
+
+- **Send a file to the agent:** attach a photo or document (with an optional
+  caption as your instruction). The bridge downloads it to `WORKDIR/inbox/` and
+  tells the agent the path — e.g. send a PDF + "summarise this", or a screenshot
+  + "what's broken here?".
+- **Get files back:** the agent saves anything it wants to send you into
+  `WORKDIR/outbox/`. After each task the bridge delivers those files over
+  WhatsApp and clears the folder. So "make a chart of X" → it writes
+  `outbox/chart.png` → it lands in your chat.
+
+Files over WhatsApp's ~16 MB limit are skipped with a notice. Both folders are
+created on demand and live under the active working directory (so `/cd` moves
+them too).
+
 ## Control commands
 
 | Message | Effect |
