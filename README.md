@@ -67,10 +67,17 @@ Requires **Node ≥ 20** and the **`claude` CLI** already installed and logged i
 
 ## Run it 24/7
 
-The bridge runs while the terminal is open. To keep it alive across reboots, install
-a `launchd` agent (macOS) or `systemd --user` unit (Linux) — see
-[`CLAUDE.md`](./CLAUDE.md#run-it-247-only-if-the-user-wants-it). Link the QR once
-interactively first; the session persists in `auth/`.
+`npm start` runs while the terminal is open. To keep it alive across reboots and
+crashes, install it as a background service:
+
+```bash
+npm run install-service     # macOS (launchd). Re-run any time to update.
+npm run uninstall-service   # remove it
+```
+
+Link the QR once with `npm start` first; the session persists in `auth/`, so the
+service reconnects silently. Logs go to `logs/service.log` and `logs/bridge.log`.
+For Linux (`systemd --user`), see [`CLAUDE.md`](./CLAUDE.md#run-it-247).
 
 ## Security
 

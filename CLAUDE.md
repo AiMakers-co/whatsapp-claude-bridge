@@ -46,9 +46,11 @@ CLI), `index.ts` (WhatsApp socket, auth, routing, control commands).
    They should get a reply. If they set a `COMMAND_PREFIX`, the test must start
    with it.
 7. **Offer to make it permanent.** The bridge only runs while the terminal is open.
-   Offer to install a `launchd` service (macOS) or `systemd` unit (Linux) so it
-   restarts on boot and after crashes. See "Run it 24/7" below — only do this if
-   the user says yes.
+   On macOS, `npm run install-service` installs a launchd agent that starts on
+   login and restarts on crash (and `npm run uninstall-service` removes it). The
+   QR must be scanned interactively once via `npm start` first; after that the
+   service reconnects silently from `auth/`. See "Run it 24/7" below. Only do this
+   if the user says yes.
 
 ## How the user drives it once live
 
@@ -59,18 +61,21 @@ CLI), `index.ts` (WhatsApp socket, auth, routing, control commands).
 - One task runs at a time per chat; a second message while busy is rejected with a
   nudge rather than queued.
 
-## Run it 24/7 (only if the user wants it)
+## Run it 24/7
 
-**macOS (launchd):** create `~/Library/LaunchAgents/co.aimakers.whatsapp-claude.plist`
-pointing `ProgramArguments` at the absolute path of `npm` (`which npm`) with args
-`["start"]`, set `WorkingDirectory` to this repo's absolute path, `RunAtLoad` and
-`KeepAlive` to `true`, and `StandardOutPath`/`StandardErrorPath` to a log file.
-Load with `launchctl load -w <plist>`. The first run still needs an interactive QR
-scan, so start it once with `npm start` and link **before** handing off to launchd
-(the `auth/` folder persists the session).
+**macOS (launchd):** just run `npm run install-service`. It resolves the absolute
+`node`/`tsx`/`claude` paths, writes
+`~/Library/LaunchAgents/co.aimakers.whatsapp-claude-bridge.plist` with `RunAtLoad`
++ `KeepAlive`, and bootstraps it. Re-run to update; `npm run uninstall-service`
+removes it. The script (`scripts/install-service.sh`) stops any running instance
+first so two processes never fight over the WhatsApp session. Link the QR once via
+`npm start` before relying on the service — `auth/` persists the session.
 
-**Linux (systemd --user):** a unit with `ExecStart=/usr/bin/npm start`,
-`WorkingDirectory=<repo>`, `Restart=always`. Same caveat: link interactively first.
+**Linux (systemd --user):** create a unit with
+`ExecStart=<abs node> <repo>/node_modules/.bin/tsx src/index.ts`,
+`WorkingDirectory=<repo>`, `Environment=PATH=...` (include node's dir and the dir
+holding the `claude` CLI), and `Restart=always`. Same caveat: link interactively
+first.
 
 ## Hard rules
 
