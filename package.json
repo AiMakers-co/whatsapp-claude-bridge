@@ -4,7 +4,12 @@
   "description": "Message your computer on WhatsApp and have Claude Code do the work. A self-hosted bridge: WhatsApp -> Claude Code (headless) -> WhatsApp.",
   "type": "module",
   "license": "MIT",
-  "author": "AI Makers Co",
+  "author": "AI Makers Co (Mark Austen)",
+  "homepage": "https://aimakers.co",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AiMakers-co/whatsapp-claude-bridge.git"
+  },
   "engines": {
     "node": ">=20"
   },

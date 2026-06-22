@@ -92,6 +92,12 @@ For Linux (`systemd --user`), see [`CLAUDE.md`](./CLAUDE.md#run-it-247).
 - **Never commit `.env` or `auth/`** — `auth/` contains your live WhatsApp session
   keys. Both are gitignored.
 
+## Credits
+
+Built by **[AI Makers Co](https://aimakers.co)**. Conceived by **Mark Austen** —
+designed and built together with Claude (Anthropic) through Claude Code. The same
+human-directs-AI collaboration this tool puts in your pocket.
+
 ## License
 
 MIT © AI Makers Co
