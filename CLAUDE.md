@@ -11,7 +11,8 @@ the human can provide (a phone, a QR scan, a path).
 A small TypeScript daemon that:
 1. Links to the user's WhatsApp via the official multi-device protocol (Baileys —
    the same mechanism as WhatsApp Web, no Business API, no cloud).
-2. Listens for messages **from the user only** (note-to-self by default).
+2. Listens **only** inside the dedicated group it creates, and **only** for
+   messages the user sent (hard lock — never note-to-self or any other chat).
 3. Runs each message as a task through `claude -p ... --output-format json
    --dangerously-skip-permissions` in a configured working directory.
 4. Sends Claude's result back over WhatsApp. Conversation continuity is preserved
@@ -32,14 +33,13 @@ or `/use <name>` per chat.
 3. **Create config:** copy `.env.example` to `.env`. Then help the user fill it in:
    - `WORKDIR` — **ask the user which project directory** Claude should operate on.
      This is the single most important setting. Use an absolute path.
-   - `ALLOWED_JIDS` — leave **empty** for the secure default (note-to-self only).
-     Only populate it if the user explicitly wants to command the bridge from
-     another person's number. Format: `<countrycode><number>@s.whatsapp.net`
-     (digits only, no `+`, no spaces).
-   - `COMMAND_PREFIX` — leave empty unless the user wants to keep using their
-     note-to-self chat for other things; then set e.g. `claude` so only messages
-     starting with that word are treated as tasks.
-   - `CLAUDE_MODEL` — leave empty to use their account default.
+   - `GROUP_NAME` — the dedicated group that is the bridge's ONLY command channel.
+     Default `Claude Chat`. The bridge is hard-locked to this group; there is no
+     allowlist and it never listens anywhere else.
+   - `PROVIDER` — `claude` (default), `codex`, `gemini`, or `grok`.
+   - `COMMAND_PREFIX` — usually empty. Set e.g. `claude` only if the user wants
+     non-task chatter in the group ignored unless it starts with that word.
+   - `MODEL` — leave empty to use the provider's default.
 4. **Start it:** `npm start`. A QR code prints in the terminal.
 5. **Ask the human to link:** "On your phone, open WhatsApp → Settings → Linked
    Devices → Link a Device, and scan the QR code in the terminal." You cannot do
@@ -86,8 +86,10 @@ first.
 - **Never commit `.env` or `auth/`.** `.env` holds config; `auth/` holds the live
   WhatsApp session keys (anyone with it can impersonate the user's WhatsApp).
   Both are in `.gitignore` — keep them there.
-- **Do not widen the allowlist** beyond what the user asked for. The default
-  (note-to-self only) means no one else can run commands on their machine.
+- **Do not weaken the hard lock.** The bridge must only ever act inside its
+  dedicated group and only on the user's own messages. Never re-introduce a
+  note-to-self path or an allowlist that opens other chats — it would collide
+  with other AI tools on the user's number.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that
   is the whole point (autonomous execution from a text). Make sure the user
   understands `WORKDIR` is where that power applies.

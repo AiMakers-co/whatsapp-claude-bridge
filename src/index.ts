@@ -39,10 +39,9 @@ function rememberSent(id?: string | null): void {
 let claudeGroupJid: string | undefined;
 
 /**
- * Find an existing group with the configured name, or create a fresh one so
- * the user gets a clean, dedicated chat thread for talking to Claude (instead
- * of cluttering their note-to-self). Falls back silently to note-to-self if
- * group creation isn't possible.
+ * Find an existing group with the configured name, or create a fresh one. This
+ * group is the ONLY channel the bridge listens on (hard lock). If it can't be
+ * found or created, the bridge stays idle rather than leaking into other chats.
  */
 async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void> {
   if (!config.createGroup) return;
@@ -67,7 +66,7 @@ async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void>
   } catch (e: any) {
     log.warn(
       `Could not set up "${config.groupName}" group: ${e?.message ?? e}. ` +
-        `Falling back to note-to-self.`,
+        `Bridge will stay idle (it only listens in that group) until it's available.`,
     );
   }
 }
@@ -138,13 +137,9 @@ async function start() {
       const me = jidNormalizedUser(sock.user?.id ?? "");
       log.info(`✅ Bridge live. Connected as ${me}`);
       log.info(`Working dir: ${config.workdir}`);
-      log.info(
-        config.allowedJids.length
-          ? `Allowed senders: ${config.allowedJids.join(", ")}`
-          : `Command channel: note-to-self (message YOURSELF in WhatsApp)`,
-      );
+      log.info(`Command channel: ONLY the "${config.groupName}" group (hard-locked).`);
       if (config.commandPrefix) log.info(`Command prefix: "${config.commandPrefix}"`);
-      log.info("Ready. Control commands: /new  /cd <path>  /status");
+      log.info("Ready. Control commands: /new  /cd <path>  /use <provider>  /status");
       void ensureGroup(sock);
     }
     if (connection === "close") {
@@ -157,27 +152,23 @@ async function start() {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-    const me = jidNormalizedUser(sock.user?.id ?? "");
 
     for (const msg of messages) {
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid) continue;
 
-      // ── Never react to our own replies (prevents an infinite loop in
-      //    note-to-self, where our outgoing messages echo back as fromMe) ──
+      // ── Never react to our own replies (prevents an echo loop) ──
       if (msg.key.id && sentIds.has(msg.key.id)) continue;
 
-      // ── Authorization ──────────────────────────────────────────
-      // Default (no allowlist): only messages YOU send (fromMe) in either the
-      // dedicated "Claude Chat" group or your note-to-self chat. With an
-      // explicit allowlist: any message from those jids.
-      const fromMe = Boolean(msg.key.fromMe);
+      // ── HARD LOCK ───────────────────────────────────────────────
+      // The bridge ONLY ever acts inside the dedicated group it created, and
+      // ONLY on messages you sent. It will NEVER touch note-to-self, your own
+      // number, DMs, or any other chat — no exceptions, no allowlist override.
+      // (Until the group is identified on connect, claudeGroupJid is undefined
+      // and nothing is processed — the safe default.)
       const isClaudeGroup = claudeGroupJid !== undefined && remoteJid === claudeGroupJid;
-      const isSelfChat = fromMe && jidNormalizedUser(remoteJid) === me;
-      const isAllowed = config.allowedJids.length
-        ? config.allowedJids.includes(jidNormalizedUser(remoteJid))
-        : fromMe && (isClaudeGroup || isSelfChat);
-      if (!isAllowed) continue;
+      if (!isClaudeGroup) continue;
+      if (!msg.key.fromMe) continue;
 
       const raw = extractText(msg)?.trim() ?? "";
       const attachment = detectAttachment(msg);

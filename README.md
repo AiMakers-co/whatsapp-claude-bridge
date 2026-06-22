@@ -27,11 +27,13 @@ runs entirely on your own machine.
         └──────────────  reply text  ◀───────────────────┘   (run in WORKDIR)
 ```
 
-- **Note-to-self by default.** The bridge only acts on messages **you send to
-  yourself**, so nobody else can run commands on your computer.
-- **Conversational.** Each chat keeps a Claude session; follow-up messages continue
-  the same conversation (`--resume`). Send `/new` to start fresh.
-- **One task at a time** per chat, with a hard timeout you control.
+- **Hard-locked to one group.** On connect the bridge creates (or finds) a single
+  dedicated group and acts **only** there, **only** on messages you send. It never
+  touches note-to-self, your own number, DMs, or any other chat — so it can't
+  collide with other tools on your WhatsApp. There is no allowlist override.
+- **Conversational.** The group keeps a session; follow-up messages continue the
+  same conversation (`--resume`). Send `/new` to start fresh.
+- **One task at a time**, with a hard timeout you control.
 
 ## Quick start
 
@@ -57,9 +59,10 @@ is the one step only a human can do — it links your WhatsApp account, by desig
 | Variable | Purpose |
 | --- | --- |
 | `WORKDIR` | Absolute path of the project Claude Code operates on. |
-| `ALLOWED_JIDS` | Comma-separated WhatsApp JIDs allowed to send commands. **Empty = note-to-self only (recommended).** Format: `31612345678@s.whatsapp.net`. |
-| `COMMAND_PREFIX` | If set (e.g. `claude`), only messages starting with it count as tasks. Empty = every message is a task. |
-| `CLAUDE_MODEL` | Optional `--model` override. Empty = account default. |
+| `GROUP_NAME` | Name of the dedicated group that is the bridge's **only** command channel. Default `Claude Chat`. |
+| `PROVIDER` | Agent CLI: `claude` (default) / `codex` / `gemini` / `grok`. |
+| `MODEL` | Optional model override for the provider. Empty = its default. |
+| `COMMAND_PREFIX` | If set (e.g. `claude`), only group messages starting with it count as tasks. Empty = every message is a task. |
 | `TASK_TIMEOUT_SECONDS` | Kill a task after this long. Default `600`. |
 
 ## Provider-agnostic
@@ -122,7 +125,8 @@ For Linux (`systemd --user`), see [`CLAUDE.md`](./CLAUDE.md#run-it-247).
 
 - The bridge runs Claude with `--dangerously-skip-permissions` **on purpose** — that
   autonomy is the point. Treat `WORKDIR` as a directory you trust Claude to act in.
-- Keep the allowlist tight (the default is just you).
+- **Hard-locked to its own group, your messages only** — it can't be triggered from
+  any other chat, so it won't fight with other AI tools on your number.
 - **Never commit `.env` or `auth/`** — `auth/` contains your live WhatsApp session
   keys. Both are gitignored.
 
