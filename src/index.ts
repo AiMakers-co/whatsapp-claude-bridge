@@ -7,7 +7,7 @@ import makeWASocket, {
 } from "@whiskeysockets/baileys";
 import pino from "pino";
 import { config } from "./config.js";
-import { runClaude } from "./claude.js";
+import { runClaude, checkClaudeCli } from "./claude.js";
 import { log } from "./logger.js";
 import { showQr } from "./qr.js";
 
@@ -86,6 +86,16 @@ function chunk(text: string, size = 4000): string[] {
 }
 
 async function start() {
+  const claudeVersion = checkClaudeCli();
+  if (claudeVersion) {
+    log.info(`Claude CLI detected: ${claudeVersion}`);
+  } else {
+    log.warn(
+      "⚠ `claude` CLI not found on PATH. Tasks will fail until Claude Code is " +
+        "installed and logged in (run `claude` once to authenticate).",
+    );
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
   const { version } = await fetchLatestBaileysVersion();
 

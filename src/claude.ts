@@ -1,5 +1,16 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { config } from "./config.js";
+
+/** Verify the `claude` CLI is callable. Returns its version, or null. */
+export function checkClaudeCli(): string | null {
+  try {
+    const r = spawnSync("claude", ["--version"], { encoding: "utf8" });
+    if (r.status === 0) return (r.stdout || "").trim() || "unknown";
+  } catch {
+    /* not found */
+  }
+  return null;
+}
 
 export interface ClaudeResult {
   text: string;

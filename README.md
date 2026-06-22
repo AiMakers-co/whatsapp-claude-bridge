@@ -37,15 +37,20 @@ runs entirely on your own machine.
 
 ```bash
 git clone <this-repo> && cd whatsapp-claude-bridge
-npm install
-cp .env.example .env        # then edit WORKDIR (the project Claude works on)
-npm start                   # scan the QR with WhatsApp → Linked Devices
+npm run setup               # checks prereqs, installs, starts — a QR opens
 ```
 
-Then open your **own** chat in WhatsApp ("Message yourself") and text it a task.
+Scan the QR (WhatsApp → **Settings → Linked Devices → Link a Device**). The bridge
+creates a **Claude Chat** group automatically — text a task into it. To keep it
+running 24/7:
 
-Requires **Node ≥ 20** and the **`claude` CLI** already installed and logged in
-(the bridge shells out to it).
+```bash
+npm run install-service     # macOS launchd; auto-starts on login
+```
+
+Requires **Node ≥ 20** and the **`claude` CLI** installed and logged in (the bridge
+shells out to it; `npm run setup` checks and warns if it's missing). Scanning the QR
+is the one step only a human can do — it links your WhatsApp account, by design.
 
 ## Configuration (`.env`)
 
