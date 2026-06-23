@@ -49,20 +49,22 @@ async function ensureGroup(sock: ReturnType<typeof makeWASocket>): Promise<void>
     const groups = await sock.groupFetchAllParticipating();
     const existing = Object.values(groups).find((g) => g.subject === config.groupName);
     if (existing) {
+      // Found it — just adopt the id. No greeting; reconnects must stay silent.
       claudeGroupJid = existing.id;
       log.info(`Using existing "${config.groupName}" group (${existing.id})`);
     } else {
       const res = await sock.groupCreate(config.groupName, []);
       claudeGroupJid = res.id;
       log.info(`Created "${config.groupName}" group (${res.id})`);
+      // Greet exactly once, only when the group is first created.
+      const welcome = await sock.sendMessage(claudeGroupJid, {
+        text:
+          `👋 *Claude Chat* is live.\n\n` +
+          `Send me any task and I'll run it with Claude Code in:\n${config.workdir}\n\n` +
+          `Control: /new  ·  /cd <path>  ·  /use <provider>  ·  /status`,
+      });
+      rememberSent(welcome?.key?.id);
     }
-    const welcome = await sock.sendMessage(claudeGroupJid, {
-      text:
-        `👋 *Claude Chat* is live.\n\n` +
-        `Send me any task and I'll run it with Claude Code in:\n${config.workdir}\n\n` +
-        `Control: /new  ·  /cd <path>  ·  /use <provider>  ·  /status`,
-    });
-    rememberSent(welcome?.key?.id);
   } catch (e: any) {
     log.warn(
       `Could not set up "${config.groupName}" group: ${e?.message ?? e}. ` +
@@ -140,7 +142,9 @@ async function start() {
       log.info(`Command channel: ONLY the "${config.groupName}" group (hard-locked).`);
       if (config.commandPrefix) log.info(`Command prefix: "${config.commandPrefix}"`);
       log.info("Ready. Control commands: /new  /cd <path>  /use <provider>  /status");
-      void ensureGroup(sock);
+      // Only resolve the group on the first successful open; reconnects keep
+      // the id we already have, so they never re-fetch or re-greet.
+      if (!claudeGroupJid) void ensureGroup(sock);
     }
     if (connection === "close") {
       const code = (lastDisconnect?.error as any)?.output?.statusCode;
