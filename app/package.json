@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-bridge-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tray app that manages the whatsapp-claude-bridge daemon as a sidecar.",
+  "type": "module",
+  "scripts": {
+    "icons": "node assets/gen-icon.mjs && tauri icon assets/icon-1024.png",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

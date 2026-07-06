@@ -4,7 +4,11 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const repoRoot = resolve(here, "..");
+// WA_BRIDGE_HOME: explicit home-dir override for compiled/sidecar builds
+// (e.g. bun build --compile), where import.meta.url no longer points at a
+// real checkout. When set, auth/, data/ and logs/ resolve under it.
+const bridgeHome = process.env.WA_BRIDGE_HOME?.trim();
+const repoRoot = bridgeHome ? resolve(bridgeHome) : resolve(here, "..");
 
 /** A WhatsApp group the bridge monitors, with its own project + permissions. */
 export interface GroupConfig {

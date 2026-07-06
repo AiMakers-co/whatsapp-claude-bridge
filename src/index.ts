@@ -200,9 +200,23 @@ function exitWithFlush(sig: string, code: number): void {
   }
   process.exit(code);
 }
-process.on("SIGTERM", () => exitWithFlush("SIGTERM", 0));
+process.on("SIGTERM", () => exitWithFlush("SIGTERM", 0)); // never delivered on Windows; harmless to register
 process.on("SIGINT", () => exitWithFlush("SIGINT", 130));
+if (process.platform === "win32") {
+  // Windows has no SIGTERM: Ctrl+Break (and some service managers stopping a
+  // console process) surfaces as SIGBREAK instead.
+  process.on("SIGBREAK", () => exitWithFlush("SIGBREAK", 0));
+}
 process.on("beforeExit", () => {
+  try {
+    flushAllNow();
+  } catch {
+    /* nothing more to do */
+  }
+});
+// Last-resort flush on any exit path (process.exit calls, fatal errors that
+// still unwind). 'exit' handlers must be synchronous — flushAllNow is.
+process.on("exit", () => {
   try {
     flushAllNow();
   } catch {
@@ -1084,6 +1098,22 @@ if (config.apiToken && config.apiToken.length < 16) {
   log.warn(
     `WA_API_TOKEN is only ${config.apiToken.length} chars — use at least 16 random chars for the control API.`,
   );
+}
+
+// Sidecar mode: the tray app sets WA_PARENT_PID. If it crashes or is killed
+// without cleaning up, self-exit instead of living on as an orphan daemon
+// (a relaunched tray would otherwise spawn a second daemon next to us).
+// Not stdin-EOF based: under launchd stdin is /dev/null and would EOF at once.
+const parentPid = Number(process.env.WA_PARENT_PID);
+if (Number.isInteger(parentPid) && parentPid > 0) {
+  setInterval(() => {
+    try {
+      process.kill(parentPid, 0); // signal 0 = existence check only
+    } catch {
+      log.warn(`Supervising app (pid ${parentPid}) is gone — exiting.`);
+      process.exit(0);
+    }
+  }, 15_000).unref();
 }
 
 start().catch((e) => {

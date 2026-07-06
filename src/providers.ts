@@ -226,6 +226,24 @@ function onPath(bin: string): boolean {
   }
 }
 
+/**
+ * Windows: npm installs CLIs as .cmd/.ps1 shims, and child_process.spawn with
+ * shell:false cannot execute .cmd/.bat (only .exe) — it hard-errors. Resolve
+ * the real target via `where`; a .cmd/.bat shim must be run through cmd.exe.
+ */
+function resolveWinBin(bin: string): string | undefined {
+  try {
+    const r = spawnSync("where", [bin], { encoding: "utf8", windowsHide: true });
+    if (r.status !== 0) return undefined;
+    return r.stdout
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .find(Boolean);
+  } catch {
+    return undefined;
+  }
+}
+
 export interface Provider {
   name: string;
   bin: string;
@@ -244,10 +262,30 @@ function runOnce(
 ): Promise<RunResult> {
   const call = spec.build(task, { model: opts.model, resumeSessionId });
   return new Promise<RunResult>((resolve) => {
-    // detached: the child gets its own process group, so on timeout we can
-    // kill the whole tree (agent CLIs spawn grandchildren that a plain
-    // child.kill leaves orphaned and still running).
-    const child = spawn(spec.bin, call.args, { cwd: opts.cwd, env: process.env, detached: true });
+    const isWin = process.platform === "win32";
+    // Unix: detached gives the child its own process group, so on timeout we
+    // can kill the whole tree (agent CLIs spawn grandchildren that a plain
+    // child.kill leaves orphaned and still running). Windows has no process
+    // groups in that sense — spawn attached and let taskkill /T walk the tree.
+    // Windows: a .cmd/.bat npm shim can't be spawned directly (shell:false);
+    // run it via cmd.exe, keeping args as an array (no string interpolation).
+    let bin = spec.bin;
+    let args = call.args;
+    if (isWin) {
+      const resolved = resolveWinBin(spec.bin);
+      if (resolved && /\.(cmd|bat)$/i.test(resolved)) {
+        bin = "cmd.exe";
+        args = ["/d", "/s", "/c", resolved, ...call.args];
+      } else if (resolved) {
+        bin = resolved;
+      }
+    }
+    const child = spawn(bin, args, {
+      cwd: opts.cwd,
+      env: process.env,
+      detached: !isWin,
+      windowsHide: true,
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -260,8 +298,14 @@ function runOnce(
     };
     const timer = setTimeout(() => {
       try {
-        if (child.pid) process.kill(-child.pid, "SIGKILL"); // whole process group
-        else child.kill("SIGKILL");
+        if (isWin && child.pid) {
+          // taskkill /T /F kills the whole child process tree.
+          spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+        } else if (child.pid) {
+          process.kill(-child.pid, "SIGKILL"); // whole process group
+        } else {
+          child.kill("SIGKILL");
+        }
       } catch {
         try {
           child.kill("SIGKILL");

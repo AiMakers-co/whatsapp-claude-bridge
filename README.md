@@ -147,9 +147,57 @@ npm run install-service     # macOS (launchd). Re-run any time to update.
 npm run uninstall-service   # remove it
 ```
 
+On Windows, use the Scheduled Task installer instead (starts on login, restarts
+on crash):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-service.ps1
+powershell -ExecutionPolicy Bypass -File scripts\uninstall-service.ps1
+```
+
+It runs the compiled daemon (`dist-bin\wa-bridge-daemon.exe`) if present,
+otherwise `node_modules\.bin\tsx src/index.ts`, and stops any already-running
+instance first.
+
 Link the QR once with `npm start` first; the session persists in `auth/`, so the
 service reconnects silently. Logs go to `logs/service.log` and `logs/bridge.log`.
 For Linux (`systemd --user`), see [`CLAUDE.md`](./CLAUDE.md#run-it-247).
+
+## Native app (Mac/Windows)
+
+A Tauri v2 tray app ("WhatsApp Bridge") wraps the daemon for people who don't
+want a terminal: it runs the bridge as a bundled sidecar binary (compiled with
+`bun build --compile`, so end machines need no Node) and shows the dashboard
+in a native window. macOS (Apple Silicon) and Windows (x64).
+
+**Where installers come from.** Every push to `main` runs the
+[`build` workflow](.github/workflows/build.yml) (also runnable manually via
+*Actions → build → Run workflow*). Download the artifacts from the workflow run:
+
+- `whatsapp-bridge-macos-aarch64` — `.dmg` and `.app.tar.gz`
+- `whatsapp-bridge-windows-x64` — `.msi` and NSIS `.exe`
+
+**Unsigned-build caveats.** CI builds are not code-signed:
+
+- **macOS:** Gatekeeper blocks the first launch. Right-click the app →
+  *Open* → *Open* (or `xattr -dr com.apple.quarantine "/Applications/WhatsApp Bridge.app"`).
+- **Windows:** SmartScreen shows "Windows protected your PC". Click
+  *More info* → *Run anyway*.
+
+**Dev commands.**
+
+```bash
+# compile the daemon sidecar for your machine (from repo root)
+bun install
+bun build --compile src/index.ts \
+  --outfile app/src-tauri/binaries/wa-bridge-daemon-$(rustc -vV | sed -n 's/host: //p')
+
+# run the tray app against it
+cd app && npm install && npx tauri dev
+
+# production bundle (installers land in app/src-tauri/target/release/bundle/)
+cd app && npx tauri build
+```
 
 ## Security
 

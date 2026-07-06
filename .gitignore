@@ -1,6 +1,7 @@
 # Secrets & WhatsApp session — NEVER commit these
 .env
 auth/
+auth.bak*/
 logs/
 qr.png
 *.log
@@ -12,9 +13,16 @@ outbox/
 # Dependencies & build
 node_modules/
 dist/
+*.bun-build
 
 # OS
 .DS_Store
 
 # Persistent message store (private conversation data)
 data/
+
+# Tauri tray app (app/) build outputs
+app/node_modules/
+app/src-tauri/target/
+app/src-tauri/binaries/
+app/src-tauri/gen/
