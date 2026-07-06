@@ -24,6 +24,16 @@ agent layer — claude/codex/gemini/grok specs + a generic CLI runner),
 and `qr.ts`. The default provider is `claude`; change with `PROVIDER` in `.env`
 or `/use <name>` per chat.
 
+There are two independent trigger paths, both in `index.ts`:
+1. **Dedicated group(s)** — every message is an unprompted task. Hard-locked:
+   fromMe or allowlisted only, never any other chat.
+2. **`@computer` mention trigger** (`handleMention`) — opt-in, works in ANY
+   chat, but only fires on messages YOU send (fromMe). It buffers a rolling
+   per-chat history (any sender) so there's context to read, and on trigger
+   runs a task with that transcript + full Claude Code power, replying into
+   the same chat. See "Hard rules" below — this is a deliberate carve-out,
+   not something to quietly revert if you see it.
+
 ## Setup procedure — do this in order
 
 1. **Check prerequisites.** Run `node -v` (need ≥20) and `claude --version`. If the
@@ -86,10 +96,17 @@ first.
 - **Never commit `.env` or `auth/`.** `.env` holds config; `auth/` holds the live
   WhatsApp session keys (anyone with it can impersonate the user's WhatsApp).
   Both are in `.gitignore` — keep them there.
-- **Do not weaken the hard lock.** The bridge must only ever act inside its
-  dedicated group and only on the user's own messages. Never re-introduce a
-  note-to-self path or an allowlist that opens other chats — it would collide
-  with other AI tools on the user's number.
+- **Do not weaken the hard lock on unprompted tasks.** Every-message-is-a-task
+  must only ever run inside the dedicated group(s) and only on the user's own
+  (or allowlisted) messages. Never make an unprompted task run in an
+  arbitrary chat, and never let anyone but the user (fromMe) invoke the
+  `@computer` mention trigger — that would collide with other AI tools on the
+  user's number or leak into chats with other people watching.
+- The `@computer` mention trigger (`ENABLE_MENTION_TRIGGER`, `MENTION_TRIGGER`
+  in `.env`) is an intentional, narrow exception the user explicitly asked
+  for: it reads history and replies in ANY chat, but strictly fromMe-gated.
+  This is not a bug and not scope creep to be reverted — if asked to touch
+  this area again, preserve the fromMe-only invariant above all else.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that
   is the whole point (autonomous execution from a text). Make sure the user
   understands `WORKDIR` is where that power applies.

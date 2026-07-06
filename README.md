@@ -34,6 +34,26 @@ runs entirely on your own machine.
 - **Conversational.** The group keeps a session; follow-up messages continue the
   same conversation (`--resume`). Send `/new` to start fresh.
 - **One task at a time**, with a hard timeout you control.
+- **`@computer` works anywhere.** Type it in any chat — a DM, a group,
+  whatever — and (as long as it's your own message) the bridge reads that
+  chat's recent messages and replies right there. See "Anywhere trigger"
+  below.
+
+## Anywhere trigger: `@computer`
+
+The dedicated group treats every message as a task. Everywhere else, nothing
+happens unless **you** (never anyone else in the chat) write the trigger word
+— default `@computer`, configurable via `MENTION_TRIGGER` in `.env`. When you
+do, the bridge:
+
+1. Looks at the last ~30 messages it's seen in that chat (from anyone).
+2. Runs them — plus whatever you wrote right after the mention — through
+   Claude Code, with the same full power (file access, commands) as the
+   dedicated group, in `WORKDIR`.
+3. Replies directly into that chat.
+
+It's fromMe-gated by design: someone else in a group chat typing `@computer`
+does nothing. Set `ENABLE_MENTION_TRIGGER=false` to turn it off entirely.
 
 ## Quick start
 
@@ -64,6 +84,8 @@ is the one step only a human can do — it links your WhatsApp account, by desig
 | `MODEL` | Optional model override for the provider. Empty = its default. |
 | `COMMAND_PREFIX` | If set (e.g. `claude`), only group messages starting with it count as tasks. Empty = every message is a task. |
 | `TASK_TIMEOUT_SECONDS` | Kill a task after this long. Default `600`. |
+| `ENABLE_MENTION_TRIGGER` | Turn the anywhere-chat `@computer` trigger on/off. Default `true`. |
+| `MENTION_TRIGGER` | The trigger word/phrase. Default `@computer`. |
 
 ## Provider-agnostic
 
@@ -107,6 +129,14 @@ them too).
 | `/use <provider>` | Switch agent CLI (claude/codex/gemini/grok) for this chat. |
 | `/status` | Show provider, current dir, session id, busy state. |
 
+## Dashboard
+
+If `WA_API_TOKEN` is set in `.env`, the bridge serves a local web dashboard at
+`http://127.0.0.1:8477` (loopback only, port configurable via `WA_API_PORT`):
+connection status, chats with message history, a compose box, recent tasks, and
+a live log tail. On first load it asks for your `WA_API_TOKEN`; all data
+endpoints require it.
+
 ## Run it 24/7
 
 `npm start` runs while the terminal is open. To keep it alive across reboots and
@@ -129,6 +159,29 @@ For Linux (`systemd --user`), see [`CLAUDE.md`](./CLAUDE.md#run-it-247).
   any other chat, so it won't fight with other AI tools on your number.
 - **Never commit `.env` or `auth/`** — `auth/` contains your live WhatsApp session
   keys. Both are gitignored.
+
+## Known limitations
+
+Deliberate scope decisions, not oversights:
+
+- **Single instance assumed.** Temp/state files in `data/` use fixed names; running two
+  bridge processes against the same folder is unsupported (the launchd service
+  guarantees one instance — stop it before re-linking with `npm start`).
+- **Loopback trust model.** The dashboard token protects the API from casual local
+  access; a malicious local process that grabs port 8477 after the bridge dies could
+  receive the token from an open dashboard tab. Loopback-only by design.
+- **No orphan reaping after a daemon crash.** A provider CLI run that survives a bridge
+  crash keeps running in its own process group until it finishes or times out on its own.
+- **No watchdog for a hung startup.** If the initial connect stalls silently (rare
+  network edge), a manual/launchd restart is the recovery path.
+- **No push alerting.** A logged-out or disconnected bridge is visible on `/health`,
+  `/status`, and the dashboard banner — nothing actively notifies you.
+- **Baileys "Bad MAC" / signal-session corruption is upstream.** Undecryptable incoming
+  messages are dropped silently (the Baileys logger runs silent); re-link if it recurs.
+- **Message history grows unbounded.** `data/messages/*.jsonl` is append-only with no
+  rotation; reads only tail the file, so it stays cheap — rotate manually if it bothers you.
+- **Logger serializes objects naively.** Log arguments should be strings; objects are
+  `JSON.stringify`'d as-is.
 
 ## Credits
 

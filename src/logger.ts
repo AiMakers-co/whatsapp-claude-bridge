@@ -10,6 +10,13 @@ const logDir = resolve(config.authDir, "..", "logs");
 mkdirSync(logDir, { recursive: true });
 export const logFile = resolve(logDir, "bridge.log");
 const stream = createWriteStream(logFile, { flags: "a" });
+// A broken log stream (disk full, rotated dir) must degrade to console-only —
+// an unhandled 'error' event would otherwise bounce through the process
+// backstop and try to write to this same broken stream.
+stream.on("error", (e) => {
+  // eslint-disable-next-line no-console
+  console.error(`log stream error (file logging degraded): ${e?.message ?? e}`);
+});
 
 function write(level: string, args: unknown[]) {
   const msg = args

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +26,25 @@ export interface RunResult {
   sessionId?: string;
   isError: boolean;
   costUsd?: number;
+  /** The run hit the hard timeout and the process tree was killed. */
+  timedOut?: boolean;
+  /**
+   * The stored resume id was stale (provider lost the session) and the task
+   * was re-run fresh — the caller should drop its stored sessionId.
+   */
+  resetSession?: boolean;
+  /**
+   * Set by parse() ONLY for a CLI-level resume failure (no valid result
+   * envelope). Never derived from the model's own output text — a task whose
+   * result merely mentions "session not found" must not be re-run (it may
+   * already have executed side effects).
+   */
+  staleSession?: boolean;
 }
+
+/** CLI diagnostics that mean the stored --resume id no longer exists.
+ * "no rollout found" is codex's phrasing for a missing thread. */
+const STALE_SESSION_RE = /no conversation found|no rollout found|session.*not found|invalid.*session/i;
 
 interface BuiltCall {
   args: string[];
@@ -58,20 +77,35 @@ const claude: ProviderSpec = {
     return {
       args,
       parse: (o) => {
-        try {
-          const j = JSON.parse(o.stdout.trim());
-          return {
-            text: j.result ?? "(no text result)",
-            sessionId: j.session_id,
-            isError: Boolean(j.is_error),
-            costUsd: j.total_cost_usd,
-          };
-        } catch {
-          return {
-            text: o.stdout.trim() || o.stderr.trim() || `claude exited with code ${o.code}`,
-            isError: o.code !== 0,
-          };
+        // The CLI can print stray lines around the JSON payload; scan from the
+        // LAST line backwards for something that parses with the expected
+        // result/session_id shape, and only fall back to raw text if nothing does.
+        const lines = [o.stdout.trim(), ...o.stdout.trim().split("\n").reverse()];
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t.startsWith("{")) continue;
+          try {
+            const j = JSON.parse(t);
+            if (j && (typeof j.result === "string" || typeof j.session_id === "string")) {
+              return {
+                text: j.result ?? "(no text result)",
+                sessionId: j.session_id,
+                isError: Boolean(j.is_error),
+                costUsd: j.total_cost_usd,
+              };
+            }
+          } catch {
+            /* not this line */
+          }
         }
+        const text = o.stdout.trim() || o.stderr.trim() || `claude exited with code ${o.code}`;
+        return {
+          text,
+          isError: o.code !== 0,
+          // Only this non-JSON fallback branch (a CLI diagnostic, not the
+          // model's result) may flag a stale --resume id.
+          staleSession: o.code !== 0 && STALE_SESSION_RE.test(text),
+        };
       },
     };
   },
@@ -83,7 +117,9 @@ const codex: ProviderSpec = {
   supportsResume: true,
   blurb: "OpenAI Codex CLI — resumable sessions (run `codex login` first)",
   build(task, { model, resumeSessionId }) {
-    const outFile = join(tmpdir(), `codex-last-${process.pid}-${Date.now()}.txt`);
+    // Random suffix: same-pid-same-millisecond concurrent tasks must not
+    // share (and clobber) one temp file.
+    const outFile = join(tmpdir(), `codex-last-${process.pid}-${randomUUID()}.txt`);
     const flags = [
       "--json",
       "--skip-git-repo-check",
@@ -98,9 +134,9 @@ const codex: ProviderSpec = {
     return {
       args,
       parse: (o) => {
-        let text = "";
+        let fileText = "";
         try {
-          text = readFileSync(outFile, "utf8").trim();
+          fileText = readFileSync(outFile, "utf8").trim();
         } catch {
           /* file may be absent on error */
         }
@@ -117,8 +153,19 @@ const codex: ProviderSpec = {
             /* non-JSON log line */
           }
         }
-        if (!text) text = errMsg || o.stderr.trim() || `codex exited with code ${o.code}`;
-        return { text, sessionId, isError: o.code !== 0 || Boolean(errMsg) };
+        const text = fileText || errMsg || o.stderr.trim() || `codex exited with code ${o.code}`;
+        return {
+          text,
+          sessionId,
+          isError: o.code !== 0 || Boolean(errMsg),
+          // Only the CLI's own diagnostics (its error event, or — when the run
+          // died before producing any task output — its stderr) may flag a
+          // stale resume id; never the outFile task output.
+          staleSession: Boolean(
+            (errMsg && STALE_SESSION_RE.test(errMsg)) ||
+              (!fileText && o.code !== 0 && STALE_SESSION_RE.test(o.stderr)),
+          ),
+        };
       },
       cleanup: () => {
         try {
@@ -188,6 +235,58 @@ export interface Provider {
   run(task: string, opts: RunOpts, timeoutMs: number): Promise<RunResult>;
 }
 
+function runOnce(
+  spec: ProviderSpec,
+  task: string,
+  opts: RunOpts,
+  timeoutMs: number,
+  resumeSessionId: string | undefined,
+): Promise<RunResult> {
+  const call = spec.build(task, { model: opts.model, resumeSessionId });
+  return new Promise<RunResult>((resolve) => {
+    // detached: the child gets its own process group, so on timeout we can
+    // kill the whole tree (agent CLIs spawn grandchildren that a plain
+    // child.kill leaves orphaned and still running).
+    const child = spawn(spec.bin, call.args, { cwd: opts.cwd, env: process.env, detached: true });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      call.cleanup?.();
+      resolve(r);
+    };
+    const timer = setTimeout(() => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL"); // whole process group
+        else child.kill("SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+      finish({
+        text: `Task timed out after ${timeoutMs / 1000}s and was killed.`,
+        isError: true,
+        timedOut: true,
+      });
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("error", (err) =>
+      finish({
+        text: `Failed to launch \`${spec.bin}\`: ${err.message}. Is it installed and on PATH?`,
+        isError: true,
+      }),
+    );
+    child.on("close", (code) => finish(call.parse({ stdout, stderr, code })));
+  });
+}
+
 export function getProvider(name: string): Provider | undefined {
   const spec = SPECS[name];
   if (!spec) return undefined;
@@ -197,36 +296,18 @@ export function getProvider(name: string): Provider | undefined {
     supportsResume: spec.supportsResume,
     blurb: spec.blurb,
     available: () => onPath(spec.bin),
-    run: (task, opts, timeoutMs) => {
+    run: async (task, opts, timeoutMs) => {
       // Only thread the resume id to providers that support it.
       const resumeSessionId = spec.supportsResume ? opts.resumeSessionId : undefined;
-      const call = spec.build(task, { model: opts.model, resumeSessionId });
-      return new Promise<RunResult>((resolve) => {
-        const child = spawn(spec.bin, call.args, { cwd: opts.cwd, env: process.env });
-        let stdout = "";
-        let stderr = "";
-        let settled = false;
-        const finish = (r: RunResult) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          call.cleanup?.();
-          resolve(r);
-        };
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-          finish({ text: `Task timed out after ${timeoutMs / 1000}s and was killed.`, isError: true });
-        }, timeoutMs);
-        child.stdout.on("data", (d) => (stdout += d.toString()));
-        child.stderr.on("data", (d) => (stderr += d.toString()));
-        child.on("error", (err) =>
-          finish({
-            text: `Failed to launch \`${spec.bin}\`: ${err.message}. Is it installed and on PATH?`,
-            isError: true,
-          }),
-        );
-        child.on("close", (code) => finish(call.parse({ stdout, stderr, code })));
-      });
+      const first = await runOnce(spec, task, opts, timeoutMs, resumeSessionId);
+      // Stale --resume id (provider lost/expired the session): retry ONCE
+      // fresh and tell the caller to drop its stored session id. Gated on the
+      // parse-level staleSession flag, never on the result text itself.
+      if (first.isError && !first.timedOut && resumeSessionId && first.staleSession) {
+        const retry = await runOnce(spec, task, opts, timeoutMs, undefined);
+        return { ...retry, resetSession: true };
+      }
+      return first;
     },
   };
 }
