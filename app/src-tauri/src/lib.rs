@@ -383,13 +383,37 @@ fn open_dashboard(app: &AppHandle) {
         let _ = win.set_focus();
         return;
     }
-    let port = api_port(&app.state::<BridgeState>().home);
+    let home = &app.state::<BridgeState>().home;
+    let port = api_port(home);
     let url = format!("http://127.0.0.1:{port}")
         .parse()
         .expect("valid dashboard url");
+    // The dashboard page prompts for WA_API_TOKEN on first load and stores it
+    // under this localStorage key (src/ui.ts TOKEN_KEY) — normally the app's
+    // own token is the one the daemon it manages actually uses, so hand it
+    // over before the page's own script runs and the prompt never appears.
+    // BUT: if another instance already owns this port (the preflight guard
+    // in start_supervisor refused to spawn our own daemon), that instance
+    // has its OWN token — ours would be silently wrong and lock the user out
+    // with an unrecoverable 401 instead of the normal manual-entry prompt.
+    // Verify our token actually authenticates against whatever answers this
+    // port before injecting it; otherwise let the page ask, as if unmanaged.
+    let token = env_value(home, "WA_API_TOKEN").unwrap_or_default();
+    let token_verified = http_get_json(port, "/status", &token)
+        .map(|v| v.get("error").is_none())
+        .unwrap_or(false);
+    // Either set the verified token, or clear anything stale from a previous
+    // (possibly wrong) run so the page's manual prompt starts clean instead
+    // of silently reusing a token that no longer authenticates.
+    let init_script = if token_verified {
+        format!("try {{ localStorage.setItem('wa-bridge-token', {token:?}); }} catch (e) {{}}")
+    } else {
+        "try { localStorage.removeItem('wa-bridge-token'); } catch (e) {}".to_string()
+    };
     let result = WebviewWindowBuilder::new(app, "dashboard", WebviewUrl::External(url))
         .title("WhatsApp Bridge")
         .inner_size(1100.0, 780.0)
+        .initialization_script(&init_script)
         .build();
     if let Err(e) = result {
         notify(app, &format!("Could not open dashboard: {e}"));
