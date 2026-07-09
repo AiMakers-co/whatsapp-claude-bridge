@@ -617,20 +617,26 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
       );
     } else {
       await safeSend(remoteJid, (res.isError ? "⚠️ " : "") + res.text);
-      // SECURITY: outbox files NEVER flush to the arbitrary chat the mention
-      // was typed in — files go to the user's own chat ("message yourself");
-      // the triggering chat gets a neutral note only.
+      // SECURITY: outbox files NEVER flush to someone ELSE's chat the mention
+      // was typed in — files go to the user's own chat. But when the trigger
+      // chat IS the user's own (note-to-self), that's where they belong and
+      // where the user expects them. Self-detection is LID-aware: WhatsApp now
+      // addresses your own chat by @lid, which does NOT equal the phone-format
+      // user id — comparing only that shipped files to a "different" chat.
       const liveSock = currentSock;
       const selfJid = liveSock ? jidNormalizedUser(liveSock.user?.id ?? "") : "";
+      const selfLid = liveSock ? jidNormalizedUser((liveSock.user as any)?.lid ?? "") : "";
+      const isSelfChat = !!remoteJid && (remoteJid === selfJid || (!!selfLid && remoteJid === selfLid));
+      const fileTarget = isSelfChat ? remoteJid : selfJid;
       let delivered: OutboxResult | null = null;
-      if (liveSock && selfJid) {
-        delivered = await flushOutbox(liveSock, selfJid, taskOutbox, rememberSent);
+      if (liveSock && fileTarget) {
+        delivered = await flushOutbox(liveSock, fileTarget, taskOutbox, rememberSent);
         removeTaskOutbox(taskOutbox);
       } else {
         orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
       }
       if (delivered) {
-        if (selfJid === remoteJid) {
+        if (isSelfChat) {
           await safeSend(remoteJid, delivered.summary);
         } else if (delivered.sentCount > 0) {
           // Claim delivery only when something WAS delivered; the full

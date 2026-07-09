@@ -46,6 +46,55 @@ export interface RunResult {
  * "no rollout found" is codex's phrasing for a missing thread. */
 const STALE_SESSION_RE = /no conversation found|no rollout found|session.*not found|invalid.*session/i;
 
+/**
+ * Pull the final result out of stream-json output (`--output-format
+ * stream-json`, or a claude version that emits an event array/NDJSON instead
+ * of the single json envelope). Without this the envelope scan finds no
+ * `{...,"result"}` line and the caller used to dump the ENTIRE raw stream —
+ * system-init events, the whole tools list, base64 blobs — into WhatsApp.
+ */
+function extractResultEvent(out: string): { text: string; sessionId?: string; isError: boolean; costUsd?: number } | undefined {
+  const consider = (ev: any) => {
+    if (!ev || typeof ev !== "object") return undefined;
+    if (typeof ev.result === "string" || ev.type === "result") {
+      return {
+        text: typeof ev.result === "string" ? ev.result : "(no text result)",
+        sessionId: ev.session_id,
+        isError: Boolean(ev.is_error) || ev.subtype === "error" || ev.subtype === "error_max_turns",
+        costUsd: ev.total_cost_usd,
+      };
+    }
+    return undefined;
+  };
+  // Whole stdout as one JSON value (array of events, or a single object).
+  try {
+    const parsed = JSON.parse(out);
+    if (Array.isArray(parsed)) {
+      for (let i = parsed.length - 1; i >= 0; i--) {
+        const r = consider(parsed[i]);
+        if (r) return r;
+      }
+    } else {
+      const r = consider(parsed);
+      if (r) return r;
+    }
+  } catch {
+    /* not a single JSON value — try NDJSON below */
+  }
+  // NDJSON: one event object per line; scan from the end for the result event.
+  for (const line of out.split("\n").reverse()) {
+    const t = line.trim();
+    if (!t.startsWith("{")) continue;
+    try {
+      const r = consider(JSON.parse(t));
+      if (r) return r;
+    } catch {
+      /* not this line */
+    }
+  }
+  return undefined;
+}
+
 interface BuiltCall {
   args: string[];
   parse: (o: { stdout: string; stderr: string; code: number | null }) => RunResult;
@@ -98,13 +147,29 @@ const claude: ProviderSpec = {
             /* not this line */
           }
         }
-        const text = o.stdout.trim() || o.stderr.trim() || `claude exited with code ${o.code}`;
+        // stream-json / event-array output — extract the real result event
+        // instead of dumping the raw stream to the chat.
+        const fromEvents = extractResultEvent(o.stdout.trim());
+        if (fromEvents) return fromEvents;
+
+        // Genuine parse failure. NEVER forward raw stdout: a multi-KB
+        // stream-json blob (system-init + tools list + base64) once flooded
+        // WhatsApp. Plain non-JSON text is a safe result; anything JSON-shaped
+        // gets a short, capped diagnostic instead.
+        const raw = (o.stdout.trim() || o.stderr.trim());
+        const jsonish = raw.startsWith("{") || raw.startsWith("[");
+        const text =
+          o.code === 0 && raw && !jsonish
+            ? raw
+            : raw
+              ? `⚠️ Couldn't parse the agent's reply (exit ${o.code}). First bytes:\n${raw.slice(0, 400)}`
+              : `claude exited with code ${o.code}`;
         return {
           text,
           isError: o.code !== 0,
           // Only this non-JSON fallback branch (a CLI diagnostic, not the
           // model's result) may flag a stale --resume id.
-          staleSession: o.code !== 0 && STALE_SESSION_RE.test(text),
+          staleSession: o.code !== 0 && STALE_SESSION_RE.test(raw),
         };
       },
     };
