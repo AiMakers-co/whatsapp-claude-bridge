@@ -137,6 +137,14 @@ connection status, chats with message history, a compose box, recent tasks, and
 a live log tail. On first load it asks for your `WA_API_TOKEN`; all data
 endpoints require it.
 
+The **⚙ Settings** panel configures the whole bridge from the UI — working
+directory, agent CLI and model, the command group, the `@computer` trigger, and
+extra monitored groups — plus an editor for each project's `CLAUDE.md` steering
+file. Save writes `.env` (surgically, preserving comments; kept at mode `600`);
+**Save & Restart** respawns the daemon, which reconnects from `auth/` with no new
+QR. The API token and port are intentionally not editable there, so the dashboard
+can't sever its own connection.
+
 ## Run it 24/7
 
 `npm start` runs while the terminal is open. To keep it alive across reboots and
