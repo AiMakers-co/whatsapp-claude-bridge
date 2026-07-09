@@ -9,6 +9,7 @@ import { join, extname, basename } from "node:path";
 import type { Readable } from "node:stream";
 import pino from "pino";
 import { log } from "./logger.js";
+import { rememberOutgoing } from "./retransmit.js";
 
 const silent = pino({ level: "silent" });
 
@@ -215,9 +216,10 @@ export async function flushOutbox(
       // rejected send must not slip its echo past the sentIds filter.
       const id = generateMessageID();
       markSent(id);
-      mimetype.startsWith("image/")
+      const delivered = mimetype.startsWith("image/")
         ? await sock.sendMessage(jid, { image: { url: path }, mimetype }, { messageId: id })
         : await sock.sendMessage(jid, { document: { url: path }, fileName: name, mimetype }, { messageId: id });
+      rememberOutgoing(delivered ?? undefined); // backs getMessage for peer retry receipts
       sent.push(name);
       try {
         unlinkSync(path);

@@ -98,6 +98,13 @@ export const config = {
   authDir: resolve(repoRoot, "auth"),
 
   /**
+   * Baileys socket log level (pino). Default silent; set WA_LOG_LEVEL=info or
+   * debug to see the protocol layer — retry receipts, session establishment,
+   * decrypt failures — when diagnosing delivery problems.
+   */
+  waLogLevel: process.env.WA_LOG_LEVEL?.trim() || "silent",
+
+  /**
    * Anywhere-in-WhatsApp trigger. Deliberately separate from the dedicated
    * group's hard lock: when YOU (fromMe only — never other participants)
    * write this word in ANY chat, the bridge reads recent conversation there

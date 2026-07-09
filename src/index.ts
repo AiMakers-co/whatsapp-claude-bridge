@@ -1,11 +1,14 @@
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   generateMessageID,
   jidNormalizedUser,
+  Browsers,
   DisconnectReason,
   type WAMessage,
 } from "@whiskeysockets/baileys";
+import { rememberOutgoing, getForRetry, makeRetryCounterCache } from "./retransmit.js";
 import pino from "pino";
 import { config, monitoredGroupConfigs, type GroupConfig } from "./config.js";
 import { getProvider, providerNames } from "./providers.js";
@@ -362,7 +365,7 @@ async function ensureGroupsInner(): Promise<void> {
         : "";
       const welcomeId = generateMessageID();
       rememberSent(welcomeId); // BEFORE the send — echo-filter even on late rejection
-      await sock.sendMessage(
+      const welcomeSent = await sock.sendMessage(
         res.id,
         {
           text:
@@ -372,6 +375,7 @@ async function ensureGroupsInner(): Promise<void> {
         },
         { messageId: welcomeId },
       );
+      rememberOutgoing(welcomeSent ?? undefined); // backs getMessage for peer retry receipts
     } catch (e: any) {
       log.warn(`Could not set up "${gc.name}" group: ${e?.message ?? e}. Skipping it.`);
     }
@@ -683,7 +687,84 @@ function scheduleRestart(): void {
   }, delay);
 }
 
+/**
+ * Fully retire a socket before another one exists. Without this, every
+ * reconnect leaked the previous socket: its event listeners stayed bound and
+ * its internal keepalive kept the old WebSocket session half-alive, so two
+ * (or more) Signal ratchets advanced over the SAME auth/ key store. That is
+ * what generated the weeks of "Bad MAC" / "closed session" corruption and
+ * left recipients on "Waiting for this message". One live socket, ever.
+ */
+function teardownSocket(sock: ReturnType<typeof makeWASocket> | undefined): void {
+  if (!sock) return;
+  try {
+    sock.ev.removeAllListeners("creds.update");
+    sock.ev.removeAllListeners("connection.update");
+    sock.ev.removeAllListeners("messaging-history.set");
+    sock.ev.removeAllListeners("contacts.upsert");
+    sock.ev.removeAllListeners("contacts.update");
+    sock.ev.removeAllListeners("messages.upsert");
+  } catch {
+    /* listener removal is best-effort */
+  }
+  try {
+    sock.end(undefined);
+  } catch {
+    /* already dead */
+  }
+}
+
+// Watchdog: a socket can die silently (no 'close' event — laptop sleep, NAT
+// timeout) and the bridge would sit "connected" forever, sending nothing.
+// Probe with a real round-trip; on failure force a clean teardown + restart.
+const HEALTH_INTERVAL_MS = 120_000;
+const HEALTH_TIMEOUT_MS = 15_000;
+let healthTimer: NodeJS.Timeout | undefined;
+
+function startHealthCheck(sock: ReturnType<typeof makeWASocket>): void {
+  clearInterval(healthTimer);
+  healthTimer = setInterval(async () => {
+    if (sock !== currentSock || !isConnected) return;
+    try {
+      const probe = sock.onWhatsApp(jidNormalizedUser(sock.user?.id ?? ""));
+      await Promise.race([
+        probe,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("health probe timed out")), HEALTH_TIMEOUT_MS)),
+      ]);
+    } catch (e: any) {
+      log.warn(`Health check failed (${e?.message ?? e}) — recycling the socket.`);
+      isConnected = false;
+      if (sock === currentSock) currentSock = undefined;
+      teardownSocket(sock);
+      clearInterval(healthTimer);
+      scheduleRestart();
+    }
+  }, HEALTH_INTERVAL_MS);
+  healthTimer.unref?.();
+}
+
+// start() must be single-flight: restartPending only serializes SCHEDULED
+// restarts — a direct start() racing a scheduled one would still build two
+// sockets. This guard makes the whole function idempotent while in flight.
+let starting = false;
+
 async function start() {
+  if (starting) return;
+  starting = true;
+  try {
+    await startInner();
+  } finally {
+    starting = false;
+  }
+}
+
+async function startInner() {
+  // One live socket, ever: retire the previous one BEFORE building the next.
+  const prev = currentSock;
+  currentSock = undefined;
+  isConnected = false;
+  teardownSocket(prev);
+
   const selected = getProvider(config.provider);
   if (!selected) {
     log.error(
@@ -703,11 +784,20 @@ async function start() {
   const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
   const { version } = await fetchLatestBaileysVersion();
 
+  const waLogger = pino({ level: config.waLogLevel });
   const sock = makeWASocket({
     version,
-    auth: state,
-    logger: pino({ level: "silent" }),
+    // Cacheable key store: signal keys served from memory instead of a disk
+    // read per operation — fewer key races under load, same on-disk format.
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, waLogger) },
+    logger: waLogger,
+    browser: Browsers.macOS("Chrome"),
     markOnlineOnConnect: false,
+    // Answer peer retry receipts with the original plaintext so a recipient
+    // that failed to decrypt gets a re-encrypted resend instead of being stuck
+    // on "Waiting for this message" forever.
+    getMessage: async (key) => getForRetry(key.id),
+    msgRetryCounterCache: makeRetryCounterCache(),
   });
 
   currentSock = sock;
@@ -715,10 +805,13 @@ async function start() {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
+    // A retired socket's events must never drive the live state machine.
+    if (sock !== currentSock) return;
     const { connection, lastDisconnect, qr } = update;
     if (qr) void showQr(qr);
     if (connection === "open") {
       isConnected = true;
+      startHealthCheck(sock);
       // Reset the backoff only once the connection has held for a while —
       // cleared on close, so an open->immediate-close flap keeps escalating.
       clearTimeout(backoffResetTimer);
@@ -768,8 +861,24 @@ async function start() {
     }
     if (connection === "close") {
       isConnected = false;
+      clearInterval(healthTimer);
       clearTimeout(backoffResetTimer); // this open didn't stabilize — keep the backoff
       const code = (lastDisconnect?.error as any)?.output?.statusCode;
+      // The server closed us — the socket is dead. Retire it fully so its
+      // internal keepalive/listeners can't touch the auth store again.
+      currentSock = undefined;
+      teardownSocket(sock);
+      if (code === DisconnectReason.connectionReplaced) {
+        // 440: ANOTHER process linked with this same auth (a dev `npm start`
+        // next to the service, a second app instance). Reconnecting instantly
+        // just steals the session back and forth, corrupting keys both ways —
+        // back off to the max and say what's happening.
+        reconnectDelayMs = RECONNECT_MAX_MS;
+        log.error(
+          "Connection REPLACED (440): another process is using this WhatsApp session. " +
+            "Find and stop it — two bridges on one auth/ corrupts the session keys.",
+        );
+      }
       const loggedOut = code === DisconnectReason.loggedOut;
       if (loggedOut) {
         // 401: the phone unlinked this device. Reconnecting would loop

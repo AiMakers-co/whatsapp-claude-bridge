@@ -24,7 +24,7 @@
     "uninstall-service": "bash scripts/uninstall-service.sh"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.18",
+    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "dotenv": "^16.4.7",
     "pino": "^9.6.0",
     "qrcode": "^1.5.4",

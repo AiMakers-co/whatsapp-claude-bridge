@@ -4,6 +4,7 @@ import { resolve, join } from "node:path";
 import { config } from "./config.js";
 import { log } from "./logger.js";
 import { recordMessage, touchContact } from "./store.js";
+import { rememberOutgoing } from "./retransmit.js";
 
 /**
  * Resilient outbound send layer. sock.sendMessage rejects hard during
@@ -92,7 +93,8 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
   if (!deps) throw new Error("outbound layer not initialised");
   const sock = deps.getSock();
   if (!sock || !deps.isConnected()) throw new Error("not connected");
-  await sock.sendMessage(jid, { text }, { messageId: id });
+  const sent = await sock.sendMessage(jid, { text }, { messageId: id });
+  rememberOutgoing(sent ?? undefined); // backs getMessage for peer retry receipts
   // Persist our own outgoing reply (echoes are filtered via sentIds, so
   // recording here is the only place this message is ever stored).
   recordMessage(jid, {

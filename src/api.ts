@@ -15,6 +15,7 @@ import {
   recordMessage,
   touchContact,
 } from "./store.js";
+import { rememberOutgoing } from "./retransmit.js";
 
 /**
  * Local control API. Loopback-only (127.0.0.1) HTTP server so any local
@@ -296,7 +297,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     // be filtered (and a caller retry with the same content stays harmless).
     const id = generateMessageID();
     deps.rememberSent(id); // echo-loop protection
-    await sock.sendMessage(target.jid, { text }, { messageId: id });
+    const apiSent = await sock.sendMessage(target.jid, { text }, { messageId: id });
+    rememberOutgoing(apiSent ?? undefined); // backs getMessage for peer retry receipts
     recordOutgoing(sock, target.jid, text);
     log.info(`[api] sent text to ${target.jid} (${text.replace(/\s+/g, " ").slice(0, 120)})`);
     json(res, 200, { ok: true, jid: target.jid, id });
@@ -341,7 +343,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     // Pre-generate + remember the id BEFORE sending (see POST /send).
     const id = generateMessageID();
     deps.rememberSent(id); // echo-loop protection
-    mimetype.startsWith("image/")
+    const fileSent = mimetype.startsWith("image/")
       ? await sock.sendMessage(target.jid, { image: { url: path }, mimetype, caption }, { messageId: id })
       : await sock.sendMessage(
           target.jid,
@@ -353,6 +355,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
           },
           { messageId: id },
         );
+    rememberOutgoing(fileSent ?? undefined); // backs getMessage for peer retry receipts
     recordOutgoing(
       sock,
       target.jid,

@@ -2,6 +2,7 @@
 .env
 auth/
 auth.bak*/
+auth-corrupt*/
 logs/
 qr.png
 *.log
