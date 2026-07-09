@@ -71,6 +71,79 @@ export const html = `<!DOCTYPE html>
   #hdr .spacer { flex: 1; }
   #panel-toggle { color: var(--fg-dim); padding: 2px 6px; }
   #panel-toggle:hover { color: var(--fg); }
+  #settings-btn { color: var(--fg-dim); padding: 2px 6px; }
+  #settings-btn:hover { color: var(--fg); }
+
+  /* ── settings overlay ── */
+  #settings-overlay {
+    position: fixed; inset: 0; display: none;
+    align-items: flex-start; justify-content: center;
+    background: rgba(10, 11, 12, 0.86); z-index: 20;
+    padding: 32px 16px; overflow-y: auto;
+  }
+  #settings-overlay.show { display: flex; }
+  #settings-box {
+    width: 640px; max-width: 100%;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  #settings-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 15px 20px; border-bottom: 1px solid var(--line);
+  }
+  #settings-head h1 { font-size: 15px; font-weight: 600; flex: 1; }
+  #settings-head .x { color: var(--fg-dim); font-size: 18px; padding: 0 6px; line-height: 1; }
+  #settings-head .x:hover { color: var(--fg); }
+  #settings-body { padding: 6px 20px 12px; }
+  .ssection { padding: 14px 0 4px; }
+  .sect-h {
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--green); opacity: 0.9; padding-bottom: 8px;
+    border-bottom: 1px solid var(--line); margin-bottom: 10px;
+  }
+  .field { margin-bottom: 13px; }
+  .field > label {
+    display: block; font-weight: 600; color: var(--fg);
+    margin-bottom: 3px; font-size: 12.5px;
+  }
+  .field .help { color: var(--fg-dim); font-size: 11.5px; margin-bottom: 5px; line-height: 1.4; }
+  .field input[type=text], .field input[type=number], .field select, .field textarea {
+    width: 100%; padding: 7px 9px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    color: var(--fg); font: inherit;
+  }
+  .field input::placeholder, .field textarea::placeholder { color: var(--fg-faint); }
+  .field input:focus, .field select:focus, .field textarea:focus {
+    outline: none; border-color: var(--green);
+  }
+  .field textarea { resize: vertical; min-height: 66px; font-family: var(--mono); font-size: 12px; }
+  .field.invalid input, .field.invalid textarea, .field.invalid select { border-color: var(--red); }
+  .field .err { color: var(--red); font-size: 11.5px; margin-top: 4px; display: none; }
+  .field.invalid .err { display: block; }
+  .field.toggle { display: flex; align-items: flex-start; gap: 9px; }
+  .field.toggle input { margin-top: 2px; width: 15px; height: 15px; accent-color: var(--green); flex: none; }
+  .field.toggle .tlabel { flex: 1; }
+  #claudemd-editor .field textarea { min-height: 200px; }
+  #cmd-path { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); }
+  #settings-foot {
+    display: flex; align-items: center; gap: 10px;
+    padding: 13px 20px; border-top: 1px solid var(--line);
+    position: sticky; bottom: 0; background: var(--panel); border-radius: 0 0 10px 10px;
+  }
+  #settings-foot .msg { flex: 1; font-size: 12px; color: var(--fg-dim); }
+  #settings-foot .msg.ok { color: var(--green); }
+  #settings-foot .msg.bad { color: var(--red); }
+  #settings-foot button {
+    padding: 7px 15px; border-radius: 6px; font-weight: 600; font-size: 12.5px;
+    border: 1px solid var(--line); color: var(--fg-dim);
+  }
+  #settings-foot button:hover { color: var(--fg); border-color: var(--fg-faint); }
+  #settings-foot button.primary {
+    background: var(--green); color: #0b0d0e; border-color: var(--green);
+  }
+  #settings-foot button.primary:hover { color: #0b0d0e; }
+  #settings-foot button:disabled { opacity: 0.5; cursor: default; }
 
   /* ── disconnected banner ── */
   #banner {
@@ -231,6 +304,7 @@ export const html = `<!DOCTYPE html>
   <span class="badge zero" id="pending">queue 0</span>
   <span class="kv mono" id="provider"></span>
   <span class="spacer"></span>
+  <button id="settings-btn" title="bridge settings">&#9881; settings</button>
   <button id="panel-toggle" title="toggle tasks/logs panel">tasks</button>
 </div>
 
@@ -265,6 +339,41 @@ export const html = `<!DOCTYPE html>
     <div id="token-err">That token was rejected (401). Try again.</div>
     <input id="token-input" type="password" placeholder="WA_API_TOKEN" autocomplete="off">
     <button id="token-save">Unlock</button>
+  </div>
+</div>
+
+<div id="settings-overlay">
+  <div id="settings-box">
+    <div id="settings-head">
+      <h1>Bridge settings</h1>
+      <button class="x" id="settings-close" title="close">&times;</button>
+    </div>
+    <div id="settings-body">
+      <div id="settings-form"></div>
+      <div class="ssection" id="claudemd-editor">
+        <div class="sect-h">Project steering &mdash; CLAUDE.md</div>
+        <div class="field">
+          <label for="cmd-workdir">Project</label>
+          <div class="help">The CLAUDE.md in this working dir is the standing instructions Claude Code reads before every task from that channel.</div>
+          <select id="cmd-workdir"></select>
+        </div>
+        <div class="field">
+          <label>Contents <span id="cmd-path"></span></label>
+          <textarea id="cmd-content" placeholder="# CLAUDE.md&#10;&#10;Instructions Claude Code follows for tasks in this project…"></textarea>
+          <div class="err" id="cmd-err"></div>
+        </div>
+        <div style="display:flex; gap:10px; align-items:center;">
+          <button id="cmd-save" style="padding:6px 13px;border-radius:6px;border:1px solid var(--line);color:var(--fg-dim);font-weight:600;">Save CLAUDE.md</button>
+          <span id="cmd-msg" style="font-size:12px;color:var(--fg-dim);"></span>
+        </div>
+      </div>
+    </div>
+    <div id="settings-foot">
+      <span class="msg" id="settings-msg"></span>
+      <button id="settings-savecancel">Close</button>
+      <button id="settings-save">Save</button>
+      <button id="settings-saverestart" class="primary">Save &amp; Restart</button>
+    </div>
   </div>
 </div>
 
@@ -566,6 +675,203 @@ export const html = `<!DOCTYPE html>
   /* ── right panel toggle ── */
   $("panel-toggle").addEventListener("click", function () {
     document.body.classList.toggle("panel-hidden");
+  });
+
+  /* ── settings panel ──────────────────────────────────────────
+     Loads field defs + values from /config, renders a grouped form,
+     edits the workdir CLAUDE.md, and saves via /config + /claudemd.
+     "Save & Restart" POSTs /restart — the Tauri supervisor respawns
+     the daemon, which reconnects from auth/ and picks up the changes. */
+  var sFields = [];
+
+  function openSettings() {
+    $("settings-overlay").classList.add("show");
+    setMsg("", "");
+    loadConfig();
+  }
+  function closeSettings() { $("settings-overlay").classList.remove("show"); }
+  function setMsg(text, kind) {
+    var m = $("settings-msg");
+    m.textContent = text || "";
+    m.className = "msg" + (kind ? " " + kind : "");
+  }
+
+  function loadConfig() {
+    api("/config").then(function (cfg) {
+      sFields = cfg.fields || [];
+      buildForm(sFields, cfg.values || {});
+      var sel = $("cmd-workdir");
+      sel.textContent = "";
+      (cfg.workdirs || []).forEach(function (w) {
+        var o = el("option", null, w);
+        o.value = w;
+        sel.appendChild(o);
+      });
+      if ((cfg.workdirs || []).length) loadClaudeMd(cfg.workdirs[0]);
+    }).catch(function (e) {
+      if (e && e.message === "unauthorized") return;
+      setMsg("Could not load settings: " + e.message, "bad");
+    });
+  }
+
+  function buildForm(fields, values) {
+    var box = $("settings-form");
+    box.textContent = "";
+    var curGroup = null, section = null;
+    fields.forEach(function (f) {
+      if (f.group !== curGroup) {
+        curGroup = f.group;
+        section = el("div", "ssection");
+        section.appendChild(el("div", "sect-h", f.group));
+        box.appendChild(section);
+      }
+      var val = values[f.key] != null ? values[f.key] : "";
+      var wrap = el("div", "field");
+      wrap.id = "field-" + f.key;
+      var control;
+      if (f.type === "bool") {
+        wrap.className = "field toggle";
+        control = document.createElement("input");
+        control.type = "checkbox";
+        // Blank defaults to enabled for the two trigger/create bools (config.ts
+        // uses "?? true"); reflect that so an untouched box isn't misleading.
+        control.checked = val === "" ? true : String(val).toLowerCase() !== "false";
+        control.id = "f-" + f.key;
+        var tl = el("div", "tlabel");
+        tl.appendChild(el("label", null, f.label));
+        if (f.help) tl.appendChild(el("div", "help", f.help));
+        wrap.appendChild(control);
+        wrap.appendChild(tl);
+      } else {
+        wrap.appendChild(el("label", null, f.label));
+        if (f.help) wrap.appendChild(el("div", "help", f.help));
+        if (f.type === "select") {
+          control = document.createElement("select");
+          (f.options || []).forEach(function (opt) {
+            var o = el("option", null, opt);
+            o.value = opt;
+            if (opt === val) o.selected = true;
+            control.appendChild(o);
+          });
+        } else if (f.type === "textarea") {
+          control = document.createElement("textarea");
+          control.value = val;
+          if (f.placeholder) control.placeholder = f.placeholder;
+        } else {
+          control = document.createElement("input");
+          control.type = f.type === "number" ? "number" : "text";
+          control.value = val;
+          if (f.placeholder) control.placeholder = f.placeholder;
+        }
+        control.id = "f-" + f.key;
+        wrap.appendChild(control);
+      }
+      var err = el("div", "err");
+      err.id = "err-" + f.key;
+      wrap.appendChild(err);
+      section.appendChild(wrap);
+    });
+  }
+
+  function collectValues() {
+    var out = {};
+    sFields.forEach(function (f) {
+      var c = $("f-" + f.key);
+      if (!c) return;
+      out[f.key] = f.type === "bool" ? (c.checked ? "true" : "false") : c.value;
+    });
+    return out;
+  }
+
+  function clearErrors() {
+    sFields.forEach(function (f) {
+      var w = $("field-" + f.key);
+      if (w) w.classList.remove("invalid");
+    });
+  }
+  function showErrors(errors) {
+    clearErrors();
+    var first = null;
+    Object.keys(errors || {}).forEach(function (k) {
+      var w = $("field-" + k), e = $("err-" + k);
+      if (w) { w.classList.add("invalid"); if (!first) first = w; }
+      if (e) e.textContent = errors[k];
+    });
+    if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function saveSettings(restart) {
+    clearErrors();
+    setMsg("Saving…", "");
+    var btns = ["settings-save", "settings-saverestart"];
+    btns.forEach(function (id) { $(id).disabled = true; });
+    // Raw fetch so we can read the body on a 400 (per-field validation errors).
+    return fetch("/config", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-wa-token": token },
+      body: JSON.stringify({ values: collectValues() }),
+    }).then(function (r) {
+      if (r.status === 401) {
+        localStorage.removeItem(TOKEN_KEY); token = ""; askToken(true);
+        throw new Error("unauthorized");
+      }
+      return r.json().then(function (j) { return { status: r.status, body: j }; });
+    }).then(function (r) {
+      if (r.status !== 200) {
+        if (r.body && r.body.errors) { showErrors(r.body.errors); setMsg("Fix the highlighted fields.", "bad"); }
+        else setMsg("Save failed (HTTP " + r.status + ").", "bad");
+        return;
+      }
+      if (restart) {
+        setMsg("Saved — restarting bridge…", "ok");
+        return api("/restart", { method: "POST" }).catch(function () {})
+          .then(function () { setTimeout(closeSettings, 1400); });
+      }
+      setMsg("Saved. Restart the bridge to apply.", "ok");
+    }).catch(function (e) {
+      if (!e || e.message !== "unauthorized") setMsg("Save failed: " + ((e && e.message) || "error"), "bad");
+    }).then(function () {
+      btns.forEach(function (id) { $(id).disabled = false; });
+    });
+  }
+
+  /* ── CLAUDE.md editor ── */
+  function loadClaudeMd(workdir) {
+    $("cmd-msg").textContent = "";
+    api("/claudemd?workdir=" + encodeURIComponent(workdir)).then(function (r) {
+      $("cmd-content").value = r.content || "";
+      $("cmd-path").textContent = r.path ? r.path : "";
+    }).catch(function () {
+      $("cmd-content").value = "";
+      $("cmd-path").textContent = "";
+    });
+  }
+  function saveClaudeMd() {
+    var workdir = $("cmd-workdir").value;
+    var msg = $("cmd-msg");
+    msg.textContent = "Saving…"; msg.style.color = "var(--fg-dim)";
+    api("/claudemd", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ workdir: workdir, content: $("cmd-content").value }),
+    }).then(function (r) {
+      msg.textContent = "Saved " + (r.path || "CLAUDE.md");
+      msg.style.color = "var(--green)";
+    }).catch(function (e) {
+      msg.textContent = "Save failed: " + (e.message || "error");
+      msg.style.color = "var(--red)";
+    });
+  }
+
+  $("settings-btn").addEventListener("click", openSettings);
+  $("settings-close").addEventListener("click", closeSettings);
+  $("settings-savecancel").addEventListener("click", closeSettings);
+  $("settings-save").addEventListener("click", function () { saveSettings(false); });
+  $("settings-saverestart").addEventListener("click", function () { saveSettings(true); });
+  $("cmd-workdir").addEventListener("change", function () { loadClaudeMd(this.value); });
+  $("cmd-save").addEventListener("click", saveClaudeMd);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape" && $("settings-overlay").classList.contains("show")) closeSettings();
   });
 
   /* ── boot + polling loops ── */

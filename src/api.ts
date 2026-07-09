@@ -16,6 +16,7 @@ import {
   touchContact,
 } from "./store.js";
 import { rememberOutgoing } from "./retransmit.js";
+import { getConfigPayload, saveConfig, readClaudeMd, writeClaudeMd } from "./settings.js";
 
 /**
  * Local control API. Loopback-only (127.0.0.1) HTTP server so any local
@@ -271,6 +272,55 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
         ...(m.mediaType ? { mediaType: m.mediaType } : {}),
       })),
     });
+    return;
+  }
+
+  // ── GET /config — settings field defs + current values ─────────
+  if (route === "GET /config") {
+    json(res, 200, getConfigPayload());
+    return;
+  }
+
+  // ── POST /config — validate + persist managed .env keys ────────
+  if (route === "POST /config") {
+    const body = await readBody(req);
+    const values = body && typeof body.values === "object" ? body.values : body;
+    const result = saveConfig(values || {});
+    if (!result.ok) {
+      json(res, 400, { ok: false, errors: result.errors });
+      return;
+    }
+    log.info("[api] settings saved via dashboard (restart to apply)");
+    json(res, 200, { ok: true, needsRestart: true });
+    return;
+  }
+
+  // ── GET /claudemd?workdir=.. — read a workdir's CLAUDE.md ──────
+  if (route === "GET /claudemd") {
+    const workdir = url.searchParams.get("workdir")?.trim() || "";
+    const r = readClaudeMd(workdir);
+    json(res, r.ok ? 200 : 400, r);
+    return;
+  }
+
+  // ── POST /claudemd { workdir, content } — write CLAUDE.md ───────
+  if (route === "POST /claudemd") {
+    const body = await readBody(req);
+    const workdir = typeof body.workdir === "string" ? body.workdir : "";
+    const content = typeof body.content === "string" ? body.content : "";
+    const r = writeClaudeMd(workdir, content);
+    if (r.ok) log.info(`[api] CLAUDE.md saved: ${r.path}`);
+    json(res, r.ok ? 200 : 400, r);
+    return;
+  }
+
+  // ── POST /restart — clean exit; the Tauri supervisor respawns ──
+  // Reconnects from auth/ (no QR), picking up any saved settings. Under a
+  // bare `npm start` (no supervisor) this just stops the process.
+  if (route === "POST /restart") {
+    log.info("[api] restart requested via dashboard");
+    json(res, 200, { ok: true });
+    setTimeout(() => process.exit(0), 150); // let the response flush first
     return;
   }
 
