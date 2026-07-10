@@ -2,6 +2,11 @@ import "dotenv/config";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import { agentReplyLabel, botReplyPrefixes } from "./replies.js";
+import {
+  parseMentionRouteEntry,
+  type MentionRoute,
+} from "./mentions.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // WA_BRIDGE_HOME: explicit home-dir override for compiled/sidecar builds
@@ -38,10 +43,11 @@ const KNOWN_PROVIDERS = new Set(["claude", "codex", "gemini", "grok"]);
 
 /**
  * Per-trigger provider routing. MENTION_TRIGGERS is a comma-separated list of
- * `trigger:provider` pairs (e.g. `@computer:claude,@codex:codex`), so a
- * different mention word can drive a different agent CLI in ANY chat. Invalid
- * entries (bad shape, unknown provider) are warned about and skipped so one
- * typo never disables the whole trigger. When unset, a single legacy entry is
+ * `trigger:provider[:model]` routes (e.g.
+ * `@computer:claude:sonnet,@codex:codex:gpt-5.6`), so each call sign can drive
+ * a different agent CLI/model in ANY chat. The two-field `trigger:provider`
+ * form remains valid. Invalid entries are warned about and skipped so one typo
+ * never disables the whole trigger. When unset, a single legacy entry is
  * derived from MENTION_TRIGGER mapped to the default provider — unchanged
  * behaviour. (console.warn, not the logger: logger.ts imports config.)
  */
@@ -49,30 +55,26 @@ function parseMentionTriggers(
   raw: string | undefined,
   fallbackTrigger: string,
   defaultProvider: string,
-): Array<{ trigger: string; provider: string }> {
-  const out: Array<{ trigger: string; provider: string }> = [];
+): MentionRoute[] {
+  const out: MentionRoute[] = [];
   if (raw && raw.trim()) {
     for (const pair of raw.split(",")) {
       const p = pair.trim();
       if (!p) continue;
-      // lastIndexOf so a trigger may itself contain a colon; the LAST colon
-      // separates trigger from provider.
-      const idx = p.lastIndexOf(":");
-      if (idx < 0) {
-        console.warn(`MENTION_TRIGGERS entry "${p}" has no ":provider" — skipped.`);
+      const parsed = parseMentionRouteEntry(p, KNOWN_PROVIDERS);
+      if (!("route" in parsed)) {
+        if (parsed.error === "missing-provider") {
+          console.warn(`MENTION_TRIGGERS entry "${p}" has no provider — skipped.`);
+        } else if (parsed.error === "empty-trigger") {
+          console.warn(`MENTION_TRIGGERS entry "${p}" has an empty trigger — skipped.`);
+        } else {
+          console.warn(
+            `MENTION_TRIGGERS: unknown provider "${parsed.provider ?? ""}" in "${p}" — skipped.`,
+          );
+        }
         continue;
       }
-      const trigger = p.slice(0, idx).trim();
-      const provider = p.slice(idx + 1).trim().toLowerCase();
-      if (!trigger) {
-        console.warn(`MENTION_TRIGGERS entry "${p}" has an empty trigger — skipped.`);
-        continue;
-      }
-      if (!KNOWN_PROVIDERS.has(provider)) {
-        console.warn(`MENTION_TRIGGERS: unknown provider "${provider}" for "${trigger}" — skipped.`);
-        continue;
-      }
-      out.push({ trigger, provider });
+      out.push(parsed.route);
     }
   }
   if (out.length === 0) out.push({ trigger: fallbackTrigger, provider: defaultProvider });
@@ -136,6 +138,20 @@ const perProviderModel: Record<string, string> = {
   gemini: process.env.GEMINI_MODEL?.trim() || "",
   grok: process.env.GROK_MODEL?.trim() || "",
 };
+const mentionTriggers = parseMentionTriggers(
+  process.env.MENTION_TRIGGERS,
+  process.env.MENTION_TRIGGER?.trim() || "@computer",
+  defaultProvider,
+);
+const configuredBotPrefixes = (process.env.BOT_REPLY_PREFIXES ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const protectedBotPrefixes = botReplyPrefixes([
+  ...configuredBotPrefixes,
+  ...mentionTriggers.map((route) => `${agentReplyLabel(route.trigger, route.provider)}:`),
+  ...[...KNOWN_PROVIDERS].map((provider) => `${agentReplyLabel(undefined, provider)}:`),
+]);
 
 export const config = {
   /** Directory Claude Code operates in. */
@@ -197,11 +213,15 @@ export const config = {
    * provider in ANY chat (fromMe only). Parsed from MENTION_TRIGGERS; when
    * unset, a single legacy entry (mentionTrigger -> default provider) is used.
    */
-  mentionTriggers: parseMentionTriggers(
-    process.env.MENTION_TRIGGERS,
-    process.env.MENTION_TRIGGER?.trim() || "@computer",
-    defaultProvider,
-  ),
+  mentionTriggers,
+
+  /**
+   * Visible prefixes emitted by local automation. fromMe is shared by every
+   * linked device/app, so a prefix is required to distinguish bot output from
+   * something the human typed. Core prefixes are always retained; the env
+   * value adds site-specific bots.
+   */
+  botReplyPrefixes: protectedBotPrefixes,
 
   /**
    * Passively download + keep incoming media (any chat, any direction) instead

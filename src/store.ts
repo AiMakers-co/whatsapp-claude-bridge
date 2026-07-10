@@ -166,7 +166,10 @@ export interface PersistedChat {
    * no longer WRITTEN; new state persists `sessions` instead.
    */
   sessionId?: string;
-  /** Resume ids keyed by provider name, so each agent keeps its own session. */
+  /**
+   * Resume ids keyed by provider for plain tasks or by call-sign/provider for
+   * explicit mention routes. The provider key remains a legacy fallback.
+   */
   sessions?: Record<string, string>;
   cwd: string;
   provider: string;

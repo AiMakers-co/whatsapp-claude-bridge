@@ -23,6 +23,7 @@ import {
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { config, monitoredGroupConfigs } from "./config.js";
+import { parseMentionRouteEntry } from "./mentions.js";
 
 const envPath = resolve(config.authDir, "..", ".env");
 
@@ -75,6 +76,22 @@ export const FIELDS: SettingField[] = [
     type: "text",
     group: "General",
     help: "Model passed to the codex provider. Blank = the provider's own default. (Each provider has its own model — one shared model would make codex run with a claude model name.)",
+    placeholder: "provider default",
+  },
+  {
+    key: "GEMINI_MODEL",
+    label: "Gemini model",
+    type: "text",
+    group: "General",
+    help: "Model passed to the gemini provider. Blank = the provider's own default.",
+    placeholder: "provider default",
+  },
+  {
+    key: "GROK_MODEL",
+    label: "Grok model",
+    type: "text",
+    group: "General",
+    help: "Model passed to the grok provider. Blank = the provider's own default.",
     placeholder: "provider default",
   },
   {
@@ -131,7 +148,7 @@ export const FIELDS: SettingField[] = [
     label: "Enable mention trigger",
     type: "bool",
     group: "Mention trigger",
-    help: "Lets you trigger the bridge from ANY chat by typing the trigger word — but only in messages you send yourself.",
+    help: "Lets you trigger the bridge from any chat, but only in messages you send yourself. In ordinary chats the trigger must be the first token.",
   },
   {
     key: "MENTION_TRIGGER",
@@ -143,11 +160,19 @@ export const FIELDS: SettingField[] = [
   },
   {
     key: "MENTION_TRIGGERS",
-    label: "Per-trigger provider routing",
+    label: "Call-sign routes",
     type: "text",
     group: "Mention trigger",
-    help: 'Comma-separated trigger:provider pairs, e.g. @computer:claude,@codex:codex — each word fires that agent in any chat. Blank = the single trigger word above with the default provider.',
-    placeholder: "trigger word → default provider",
+    help: 'Comma-separated trigger:provider:model routes. The model is optional, so existing routes such as @computer:claude still work. Example: @computer:claude:sonnet,@codex:codex:gpt-5.6. Each call sign keeps its own session.',
+    placeholder: "@computer:claude:sonnet,@codex:codex:gpt-5.6",
+  },
+  {
+    key: "BOT_REPLY_PREFIXES",
+    label: "Other bot reply prefixes",
+    type: "text",
+    group: "Mention trigger",
+    help: "Comma-separated prefixes from other automations that must never trigger agents. Nora:, Computer:, Codex: and Bridge: are always ignored.",
+    placeholder: "e.g. Growth Bot:, SEO Agent:",
   },
   // ── Media ──
   {
@@ -299,15 +324,12 @@ function validate(updates: Record<string, string>): Record<string, string> {
     for (const pair of triggers.split(",")) {
       const p = pair.trim();
       if (!p) continue;
-      const idx = p.lastIndexOf(":");
-      const trigger = idx >= 0 ? p.slice(0, idx).trim() : "";
-      const provider = idx >= 0 ? p.slice(idx + 1).trim().toLowerCase() : "";
-      if (!trigger || !provider) {
-        errors.MENTION_TRIGGERS = `Each entry must be "trigger:provider" — bad entry: "${p}".`;
-        break;
-      }
-      if (!valid.has(provider)) {
-        errors.MENTION_TRIGGERS = `Unknown provider "${provider}" — use claude, codex, gemini or grok.`;
+      const parsed = parseMentionRouteEntry(p, valid);
+      if (!("route" in parsed)) {
+        errors.MENTION_TRIGGERS =
+          parsed.error === "unknown-provider"
+            ? `Unknown provider "${parsed.provider ?? ""}" — use claude, codex, gemini or grok.`
+            : `Each entry must be "trigger:provider" or "trigger:provider:model" — bad entry: "${p}".`;
         break;
       }
     }

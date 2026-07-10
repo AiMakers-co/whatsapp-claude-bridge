@@ -16,6 +16,7 @@ import {
   touchContact,
 } from "./store.js";
 import { rememberOutgoing } from "./retransmit.js";
+import { markAutomated, prefixReply } from "./replies.js";
 import { getConfigPayload, saveConfig, readClaudeMd, writeClaudeMd } from "./settings.js";
 
 /**
@@ -347,9 +348,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     // be filtered (and a caller retry with the same content stays harmless).
     const id = generateMessageID();
     deps.rememberSent(id); // echo-loop protection
-    const apiSent = await sock.sendMessage(target.jid, { text }, { messageId: id });
+    const visibleText = prefixReply("Bridge", text);
+    const apiSent = await sock.sendMessage(
+      target.jid,
+      { text: markAutomated(visibleText) },
+      { messageId: id },
+    );
     rememberOutgoing(apiSent ?? undefined); // backs getMessage for peer retry receipts
-    recordOutgoing(sock, target.jid, text);
+    recordOutgoing(sock, target.jid, visibleText);
     log.info(`[api] sent text to ${target.jid} (${text.replace(/\s+/g, " ").slice(0, 120)})`);
     json(res, 200, { ok: true, jid: target.jid, id });
     return;
@@ -393,15 +399,23 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     // Pre-generate + remember the id BEFORE sending (see POST /send).
     const id = generateMessageID();
     deps.rememberSent(id); // echo-loop protection
+    // Even a captionless file needs the invisible marker: if WhatsApp rewrites
+    // the id while syncing linked devices, its echo must not become an
+    // authorized attachment task inside a monitored group.
+    const wireCaption = markAutomated(prefixReply("Bridge", caption ?? "attachment"));
     const fileSent = mimetype.startsWith("image/")
-      ? await sock.sendMessage(target.jid, { image: { url: path }, mimetype, caption }, { messageId: id })
+      ? await sock.sendMessage(
+          target.jid,
+          { image: { url: path }, mimetype, caption: wireCaption },
+          { messageId: id },
+        )
       : await sock.sendMessage(
           target.jid,
           {
             document: { url: path },
             fileName: name,
             mimetype,
-            caption,
+            caption: wireCaption,
           },
           { messageId: id },
         );
@@ -409,7 +423,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     recordOutgoing(
       sock,
       target.jid,
-      caption ? `[sent ${name}] ${caption}` : `[sent ${name}]`,
+      prefixReply("Bridge", caption ? `[sent ${name}] ${caption}` : `[sent ${name}]`),
       mimetype.startsWith("image/") ? "image" : "document",
     );
     log.info(`[api] sent file ${name} (${size} bytes) to ${target.jid}`);

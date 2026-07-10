@@ -41,20 +41,31 @@ runs entirely on your own machine.
 
 The dedicated group treats every message as a task. Everywhere else, nothing
 happens unless **you** (never anyone else in the chat) write a configured
-trigger. `MENTION_TRIGGERS=@computer:claude,@codex:codex` routes each trigger
-to its own agent and keeps an independent resumable session for each provider
-inside that chat. When you use one, the bridge:
+trigger. For example,
+`MENTION_TRIGGERS=@computer:claude:sonnet,@codex:codex:gpt-5.6` routes each
+call sign to its own agent and model. The model suffix is optional, so existing
+`trigger:provider` routes remain valid. Each call sign keeps an independent
+resumable session inside that chat, even if two call signs use the same
+provider. In ordinary chats the trigger must be the first token
+(`@codex do this`); inside a dedicated command group it may also select the
+provider mid-message. When you use one, the bridge:
 
 1. Looks at the last ~30 messages it's seen in that chat (from anyone).
 2. Runs them — plus whatever you wrote right after the mention — through the
-   selected agent CLI, with the same full power (file access, commands) as the
-   dedicated group, in `WORKDIR`.
+   selected agent CLI/model, with the same full power (file access, commands)
+   as the dedicated group, in `WORKDIR`.
 3. Replies directly into that chat.
 
 It's fromMe-gated by design: someone else typing `@computer` or `@codex` does
 nothing. In a dedicated command group, an explicit trigger overrides the
-group's default provider for that task only. Set `ENABLE_MENTION_TRIGGER=false`
+group’s default provider for that task only. Set `ENABLE_MENTION_TRIGGER=false`
 to turn all mention triggers off.
+
+Replies are source-labelled (`Computer:`, `Codex:`, or `Bridge:`). Because
+WhatsApp marks messages from every linked automation as `fromMe`, the bridge
+also ignores those labels plus `Nora:` and any prefixes configured in
+`BOT_REPLY_PREFIXES`. An invisible wire marker and a short burst circuit
+breaker provide two additional safeguards against bot-to-bot loops.
 
 ## Quick start
 
@@ -88,7 +99,8 @@ human can do — it links your WhatsApp account, by design.
 | `TASK_TIMEOUT_SECONDS` | Kill a task after this long. Default `600`. |
 | `ENABLE_MENTION_TRIGGER` | Turn the anywhere-chat `@computer` trigger on/off. Default `true`. |
 | `MENTION_TRIGGER` | The trigger word/phrase. Default `@computer`. |
-| `MENTION_TRIGGERS` | Optional comma-separated `trigger:provider` routes, e.g. `@computer:claude,@codex:codex`. |
+| `MENTION_TRIGGERS` | Optional comma-separated `trigger:provider[:model]` call-sign routes, e.g. `@computer:claude:sonnet,@codex:codex:gpt-5.6`. Model is optional; sessions are isolated per call sign. |
+| `BOT_REPLY_PREFIXES` | Additional comma-separated bot prefixes that must never run as tasks. Core prefixes `Nora:`, `Computer:`, `Codex:`, and `Bridge:` are always ignored. |
 
 ## Provider-agnostic
 

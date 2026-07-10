@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { log } from "./logger.js";
 import { recordMessage, touchContact } from "./store.js";
 import { rememberOutgoing } from "./retransmit.js";
+import { markAutomated, stripAutomationMarker } from "./replies.js";
 
 /**
  * Resilient outbound send layer. sock.sendMessage rejects hard during
@@ -68,20 +69,31 @@ function sleep(ms: number): Promise<void> {
  * code-point boundaries: a chunk edge must never cut a surrogate pair in half
  * (a lone surrogate renders as U+FFFD in the delivered message).
  */
-function chunk(text: string, size = 4000): string[] {
+const VISIBLE_SOURCE_RE = /^([A-Za-z0-9_-]{1,32}:)\s*/;
+
+export function chunkForWhatsApp(text: string, size = 4000): string[] {
   if (text.length <= size) return [text];
   const out: string[] = [];
+  const sourcePrefix = text.match(VISIBLE_SOURCE_RE)?.[1] ?? "";
   let i = 0;
   while (i < text.length) {
-    let end = Math.min(i + size, text.length);
+    const repeatedPrefix = i > 0 && sourcePrefix ? `${sourcePrefix} ` : "";
+    const capacity = Math.max(1, size - repeatedPrefix.length);
+    let end = Math.min(i + capacity, text.length);
     if (end < text.length) {
       const c = text.charCodeAt(end - 1);
       if (c >= 0xd800 && c <= 0xdbff) end--; // high surrogate at the edge — back off
     }
-    out.push(text.slice(i, end));
+    out.push(repeatedPrefix + text.slice(i, end));
     i = end;
   }
   return out;
+}
+
+export function delayedReplyText(text: string): string {
+  const match = text.match(VISIBLE_SOURCE_RE);
+  if (!match) return `(delayed) ${text}`;
+  return `${match[1]} (delayed) ${text.slice(match[0].length)}`;
 }
 
 /**
@@ -93,7 +105,10 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
   if (!deps) throw new Error("outbound layer not initialised");
   const sock = deps.getSock();
   if (!sock || !deps.isConnected()) throw new Error("not connected");
-  const sent = await sock.sendMessage(jid, { text }, { messageId: id });
+  // Mark every wire frame, including continuation chunks and delayed queue
+  // flushes. WhatsApp can rewrite ids when syncing linked devices; the marker
+  // remains a second, content-level echo guard.
+  const sent = await sock.sendMessage(jid, { text: markAutomated(text) }, { messageId: id });
   rememberOutgoing(sent ?? undefined); // backs getMessage for peer retry receipts
   // Persist our own outgoing reply (echoes are filtered via sentIds, so
   // recording here is the only place this message is ever stored).
@@ -102,7 +117,7 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
     fromMe: true,
     sender: jidNormalizedUser(sock.user?.id ?? ""),
     senderName: "You",
-    text,
+    text: stripAutomationMarker(text),
   });
   touchContact(jid);
 }
@@ -221,7 +236,7 @@ function scheduleDrain(): void {
  */
 export async function safeSend(jid: string, text: string): Promise<void> {
   let queueRest = false;
-  for (const part of chunk(text)) {
+  for (const part of chunkForWhatsApp(text)) {
     // Per-jid ordering across CALLS too: if earlier messages to this chat are
     // still queued, a live send now would overtake them — queue behind them.
     if (!queueRest && loadQueue().some((e) => e.jid === jid)) queueRest = true;
@@ -307,7 +322,7 @@ async function flushQueueOnce(): Promise<void> {
     deps.rememberSent(entry.id);
     try {
       // "(delayed)" so the recipient understands why this arrives late.
-      await sendOnce(entry.jid, `(delayed) ${entry.text}`, entry.id);
+      await sendOnce(entry.jid, delayedReplyText(entry.text), entry.id);
       const cur = loadQueue();
       const i = cur.indexOf(entry);
       if (i >= 0) cur.splice(i, 1);

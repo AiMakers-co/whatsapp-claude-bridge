@@ -10,6 +10,7 @@ import type { Readable } from "node:stream";
 import pino from "pino";
 import { log } from "./logger.js";
 import { rememberOutgoing } from "./retransmit.js";
+import { markAutomated, prefixReply } from "./replies.js";
 
 const silent = pino({ level: "silent" });
 
@@ -257,8 +258,25 @@ export async function flushOutbox(
       const id = generateMessageID();
       markSent(id);
       const delivered = mimetype.startsWith("image/")
-        ? await sock.sendMessage(jid, { image: { url: path }, mimetype }, { messageId: id })
-        : await sock.sendMessage(jid, { document: { url: path }, fileName: name, mimetype }, { messageId: id });
+        ? await sock.sendMessage(
+            jid,
+            {
+              image: { url: path },
+              mimetype,
+              caption: markAutomated(prefixReply("Bridge", "attachment")),
+            },
+            { messageId: id },
+          )
+        : await sock.sendMessage(
+            jid,
+            {
+              document: { url: path },
+              fileName: name,
+              mimetype,
+              caption: markAutomated(prefixReply("Bridge", "attachment")),
+            },
+            { messageId: id },
+          );
       rememberOutgoing(delivered ?? undefined); // backs getMessage for peer retry receipts
       sent.push(name);
       try {

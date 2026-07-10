@@ -27,11 +27,12 @@ or `/use <name>` per chat.
 There are two independent trigger paths, both in `index.ts`:
 1. **Dedicated group(s)** — every message is an unprompted task. Hard-locked:
    fromMe or allowlisted only, never any other chat.
-2. **Per-provider mention triggers** — opt-in, work in ANY chat, but only fire
+2. **Per-call-sign mention triggers** — opt-in, work in ANY chat, but only fire
    on messages YOU send (fromMe). `MENTION_TRIGGERS` can route e.g.
-   `@computer:claude,@codex:codex`; sessions are independent per provider per
-   chat. Ordinary chats use `handleMention`; monitored groups apply the same
-   provider override to their normal task path. See "Hard rules" below.
+   `@computer:claude:sonnet,@codex:codex:gpt-5.6`; model suffixes are optional
+   and sessions are independent per call sign per chat. In ordinary chats the
+   trigger must be the first token; monitored groups retain an anywhere-token
+   provider override. See "Hard rules" below.
 
 ## Setup procedure — do this in order
 
@@ -104,6 +105,11 @@ first.
 - The mention triggers (`ENABLE_MENTION_TRIGGER`, `MENTION_TRIGGER`, and
   `MENTION_TRIGGERS` in `.env`) are an intentional, narrow exception the user
   explicitly asked for: they reply in ANY chat, but are strictly fromMe-gated.
+- `fromMe` includes every linked automation using the owner's WhatsApp account,
+  not just human typing. Preserve all loop barriers: visible source prefixes,
+  the invisible outbound marker, bot-prefix suppression, leading-only ordinary
+  triggers, PN/LID self-chat canonicalization, busy throttling, and the burst
+  circuit breaker. Never interpolate a live trigger token into a busy notice.
   This is not a bug and not scope creep to be reverted — if asked to touch
   this area again, preserve the fromMe-only invariant above all else.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that

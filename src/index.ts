@@ -12,7 +12,21 @@ import { rememberOutgoing, getForRetry, makeRetryCounterCache } from "./retransm
 import pino from "pino";
 import { config, monitoredGroupConfigs, type GroupConfig } from "./config.js";
 import { getProvider, providerNames } from "./providers.js";
-import { matchMention, stripMentionToken } from "./mentions.js";
+import {
+  claimMentionSession,
+  getMentionSession,
+  matchMention,
+  stripMentionToken,
+} from "./mentions.js";
+import { canonicalChatKeyFor, MentionLoopGuard } from "./loop-guard.js";
+import { extractMessageText } from "./message-text.js";
+import {
+  agentReplyLabel,
+  hasAutomationMarker,
+  hasBotReplyPrefix,
+  markAutomated,
+  prefixReply,
+} from "./replies.js";
 import {
   detectAttachment,
   saveIncoming,
@@ -48,12 +62,12 @@ import {
 import { initOutbound, safeSend, flushPending } from "./outbound.js";
 import { runtime, taskStarted, taskFinished } from "./runtime.js";
 
-/** Per-chat conversation state: provider, per-provider sessions, working dir. */
+/** Per-chat conversation state: provider/call-sign sessions and working dir. */
 interface ChatState {
   /**
-   * Resume ids keyed by provider name. Each provider (claude/codex/…) tracks
-   * its own session, so a per-trigger provider switch (Feature 1) or /use never
-   * hands one CLI another CLI's opaque session id.
+   * Resume ids keyed by provider for plain group tasks and by call sign plus
+   * provider for explicit routes. This keeps two call signs on one provider
+   * independent and never hands one CLI another CLI's opaque session id.
    */
   sessions: Record<string, string>;
   cwd: string;
@@ -185,6 +199,48 @@ const monitoredGroups = new Map<string, GroupConfig>();
 let currentSock: ReturnType<typeof makeWASocket> | undefined;
 let isConnected = false;
 
+/**
+ * WhatsApp exposes the user's self-chat under both a phone JID and a LID.
+ * Treat them as one logical chat for sessions, busy state, history and loop
+ * limits; the 2026-07-10 loop crossed those aliases and ran concurrently.
+ */
+function canonicalChatKey(jid: string): string {
+  const normalized = jidNormalizedUser(jid);
+  const phone = jidNormalizedUser(currentSock?.user?.id ?? "");
+  const lid = jidNormalizedUser((currentSock?.user as any)?.lid ?? "");
+  return canonicalChatKeyFor(jid, normalized, phone, lid);
+}
+
+const loopGuard = new MentionLoopGuard();
+const busyNoticeAt = new Map<string, number>();
+const BUSY_NOTICE_COOLDOWN_MS = 30_000;
+
+async function sendBusyNotice(remoteJid: string): Promise<void> {
+  const key = canonicalChatKey(remoteJid);
+  const now = Date.now();
+  if (now - (busyNoticeAt.get(key) ?? 0) < BUSY_NOTICE_COOLDOWN_MS) return;
+  busyNoticeAt.set(key, now);
+  await safeSend(
+    remoteJid,
+    prefixReply("Bridge", "⏳ Another request is already running in this chat — please wait for its reply."),
+  );
+}
+
+async function allowTaskAttempt(remoteJid: string): Promise<boolean> {
+  const decision = loopGuard.record(canonicalChatKey(remoteJid));
+  if (decision.allowed) return true;
+  if (decision.tripped) {
+    await safeSend(
+      remoteJid,
+      prefixReply(
+        "Bridge",
+        "🛑 Loop protection paused agent requests in this chat for two minutes. No further automated requests will run during the pause.",
+      ),
+    );
+  }
+  return false;
+}
+
 // Resilient send layer (src/outbound.ts) reads the LIVE socket through the
 // same getters — a long-running task never sends through a stale socket.
 initOutbound({
@@ -262,11 +318,12 @@ const MENTION_CHATS_LIMIT = 300; // chats tracked before the oldest is evicted
 const chatHistory = new Map<string, HistoryEntry[]>();
 
 function bufferHistory(jid: string, entry: HistoryEntry): void {
-  const hist = chatHistory.get(jid) ?? [];
-  chatHistory.delete(jid); // re-set below to move this chat to MRU position
+  const key = canonicalChatKey(jid);
+  const hist = chatHistory.get(key) ?? [];
+  chatHistory.delete(key); // re-set below to move this chat to MRU position
   hist.push(entry);
   if (hist.length > MENTION_HISTORY_LIMIT) hist.shift();
-  chatHistory.set(jid, hist);
+  chatHistory.set(key, hist);
   if (chatHistory.size > MENTION_CHATS_LIMIT) {
     const oldest = chatHistory.keys().next().value as string | undefined;
     if (oldest) chatHistory.delete(oldest);
@@ -274,7 +331,7 @@ function bufferHistory(jid: string, entry: HistoryEntry): void {
 }
 
 function formatHistory(jid: string): string {
-  const hist = chatHistory.get(jid) ?? [];
+  const hist = chatHistory.get(canonicalChatKey(jid)) ?? [];
   return hist
     .map((e) => {
       const t = new Date(e.ts * 1000);
@@ -387,10 +444,14 @@ async function ensureGroupsInner(): Promise<void> {
       const welcomeSent = await sock.sendMessage(
         res.id,
         {
-          text:
-            `👋 *${gc.name}* is live.\n\n` +
-            `Send a task and I'll run it with Claude Code in:\n${gc.workdir}${who}\n\n` +
-            `Control: /new  ·  /cd <path>  ·  /use <provider>  ·  /status`,
+          text: markAutomated(
+            prefixReply(
+              "Bridge",
+              `👋 *${gc.name}* is live.\n\n` +
+                `Send a task and I'll run it with an agent in:\n${gc.workdir}${who}\n\n` +
+                `Control: /new  ·  /cd <path>  ·  /use <provider>  ·  /status`,
+            ),
+          ),
         },
         { messageId: welcomeId },
       );
@@ -408,10 +469,34 @@ async function ensureGroupsInner(): Promise<void> {
 }
 
 function getChat(jid: string, defaultCwd: string): ChatState {
-  let c = chats.get(jid);
+  const key = canonicalChatKey(jid);
+  let c = chats.get(key);
+  const alias = key !== jid ? chats.get(jid) : undefined;
+
+  if (!c && alias) {
+    c = alias;
+    chats.set(key, c);
+    chats.delete(jid);
+    persistChats();
+  } else if (c && alias && c !== alias) {
+    // One-time migration of pre-fix PN/LID state. The inbound alias is the
+    // human-authored self-chat seen on this account, so prefer its sessions;
+    // the phone-keyed state may have been created by a linked automation loop.
+    c.sessions =
+      c.cwd === alias.cwd
+        ? { ...c.sessions, ...alias.sessions }
+        : { ...alias.sessions };
+    c.cwd = alias.cwd;
+    c.provider = alias.provider;
+    c.busy ||= alias.busy;
+    c.generation = Math.max(c.generation, alias.generation);
+    c.pendingWarn ??= alias.pendingWarn;
+    chats.delete(jid);
+    persistChats();
+  }
   if (!c) {
     c = { cwd: defaultCwd, busy: false, provider: config.provider, generation: 0, sessions: {} };
-    chats.set(jid, c);
+    chats.set(key, c);
     persistChats();
   }
   return c;
@@ -453,15 +538,7 @@ function ensureCwdValid(chat: ChatState, fallback: string): boolean {
 
 /** Extract plain text from the many WhatsApp message shapes. */
 function extractText(msg: WAMessage): string | undefined {
-  const m = msg.message;
-  if (!m) return undefined;
-  return (
-    m.conversation ??
-    m.extendedTextMessage?.text ??
-    m.imageMessage?.caption ??
-    m.videoMessage?.caption ??
-    undefined
-  );
+  return extractMessageText(msg.message);
 }
 
 // Replies go through safeSend (src/outbound.ts): chunked, retried across
@@ -579,20 +656,28 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   // trigger when it ends the token ("@computer." fires, "@computer.com" does
   // not). Longest trigger first so a shorter one can't shadow a longer overlap;
   // first match in that order wins.
-  const matched = matchMention(raw, config.mentionTriggers);
+  // Ordinary chats require the trigger to be the first token. This keeps
+  // conversational text such as "Nora: directed at @codex" from becoming a
+  // command while retaining anywhere-token provider selection in command groups.
+  const matched = matchMention(raw, config.mentionTriggers, { leadingOnly: true });
   if (!matched) return;
+
+  const sourceLabel = agentReplyLabel(matched.trigger, matched.provider);
+  const agentReply = (text: string) => safeSend(remoteJid, prefixReply(sourceLabel, text));
+  const bridgeReply = (text: string) => safeSend(remoteJid, prefixReply("Bridge", text));
+
+  if (msg.key.fromMe && !(await allowTaskAttempt(remoteJid))) return;
 
   const chat = getChat(remoteJid, config.workdir);
   if (chat.busy) {
-    await safeSend(remoteJid, `⏳ Still working on the previous ${matched.trigger} request here — hang on.`);
+    await sendBusyNotice(remoteJid);
     return;
   }
   // The trigger — not the chat's default provider — selects the agent here.
   const provider = getProvider(matched.provider);
   if (!provider) return;
   if (!ensureCwdValid(chat, config.workdir)) {
-    await safeSend(
-      remoteJid,
+    await bridgeReply(
       `⚠️ Working dir is missing (and the configured fallback too):\n${config.workdir}\nRestore it before sending tasks.`,
     );
     return;
@@ -610,8 +695,13 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   chat.busy = true;
   const gen = chat.generation;
   const taskCwd = chat.cwd;
-  // Resume the session for THIS trigger's provider (per-provider sessions).
-  const sessionAtDispatch = chat.sessions[provider.name];
+  // Every call sign owns a distinct resumable session, even when two routes
+  // use the same provider. On first use, claim a legacy provider-keyed session
+  // so existing conversations survive this storage-key migration.
+  const claimedSession = claimMentionSession(chat.sessions, matched);
+  const sessionKey = claimedSession.key;
+  const sessionAtDispatch = claimedSession.sessionId;
+  if (claimedSession.migratedLegacy) persistChats();
   const outboxRoot = join(taskCwd, "outbox");
   // Per-task private outbox: concurrent tasks sharing a workdir must never
   // sweep each other's in-flight files.
@@ -633,7 +723,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   // Presence (and every later send) resolves the CURRENT socket via the
   // getter — long tasks outlive reconnects, so a captured sock goes stale.
   await currentSock?.sendPresenceUpdate("composing", remoteJid).catch(() => {});
-  if (warn) await safeSend(remoteJid, warn);
+  if (warn) await bridgeReply(warn);
   log.info(`[${remoteJid}] (${matched.trigger}, ${provider.name}) triggered`);
   // Quarantine legacy loose files in the shared outbox root (per-task subdirs
   // are never touched). Skipped while another chat has a task running in this
@@ -651,14 +741,18 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
     mkdirSync(taskOutbox, { recursive: true });
     const res = await provider.run(
       task,
-      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.modelFor(provider.name) },
+      {
+        cwd: taskCwd,
+        resumeSessionId: sessionAtDispatch,
+        model: matched.model ?? config.modelFor(provider.name),
+      },
       config.taskTimeoutMs,
     );
-    // Session writeback (keyed by provider) only if no control command changed
-    // state meanwhile.
+    // Session writeback (keyed by call sign + provider) only if no control
+    // command changed state meanwhile.
     if (chat.generation === gen) {
-      if (res.resetSession) delete chat.sessions[provider.name]; // stale --resume id recovered
-      if (res.sessionId) chat.sessions[provider.name] = res.sessionId;
+      if (res.resetSession) delete chat.sessions[sessionKey]; // stale --resume id recovered
+      if (res.sessionId) chat.sessions[sessionKey] = res.sessionId;
       persistChats();
     }
     taskFinished(rec, {
@@ -669,12 +763,11 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
       // The agent was SIGKILLed mid-flight — anything in its outbox may be a
       // truncated partial write. Hold, never deliver.
       const held = orphanTaskOutbox(taskOutbox, outboxRoot);
-      await safeSend(
-        remoteJid,
+      await bridgeReply(
         "⚠️ " + res.text + (held ? "\n📎 Files it was writing were held (not sent) — see outbox/.orphaned/." : ""),
       );
     } else {
-      await safeSend(remoteJid, (res.isError ? "⚠️ " : "") + res.text);
+      await agentReply((res.isError ? "⚠️ " : "") + res.text);
       // SECURITY: outbox files NEVER flush to someone ELSE's chat the mention
       // was typed in — files go to the user's own chat. But when the trigger
       // chat IS the user's own (note-to-self), that's where they belong and
@@ -695,16 +788,16 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
       }
       if (delivered) {
         if (isSelfChat) {
-          await safeSend(remoteJid, delivered.summary);
+          await bridgeReply(delivered.summary);
         } else if (delivered.sentCount > 0) {
           // Claim delivery only when something WAS delivered; the full
           // summary (incl. any skips) goes to the self chat with the files.
-          await safeSend(remoteJid, "📎 File(s) delivered to your personal chat.");
-          await safeSend(selfJid, delivered.summary);
+          await bridgeReply("📎 File(s) delivered to your personal chat.");
+          await safeSend(selfJid, prefixReply("Bridge", delivered.summary));
         } else {
           // Nothing was sent (all skipped: too large / send failed) — never
           // claim delivery; surface the skip reasons instead.
-          await safeSend(remoteJid, `⚠️ Couldn't deliver file(s):\n${delivered.summary}`);
+          await bridgeReply(`⚠️ Couldn't deliver file(s):\n${delivered.summary}`);
         }
       }
     }
@@ -712,7 +805,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
     log.error(`[${remoteJid}] ${matched.trigger} error: ${e?.message ?? e}`);
     taskFinished(rec, { status: "error" });
     orphanTaskOutbox(taskOutbox, outboxRoot);
-    await safeSend(remoteJid, `💥 Bridge error: ${e?.message ?? e}`);
+    await bridgeReply(`💥 ${e?.message ?? e}`);
   } finally {
     cwdTaskFinished(taskCwd);
     chat.busy = false;
@@ -887,6 +980,12 @@ async function startInner() {
       // Deliver anything queued while we were down (or before a restart).
       void flushPending();
       const me = jidNormalizedUser(sock.user?.id ?? "");
+      const selfLid = jidNormalizedUser((sock.user as any)?.lid ?? "");
+      if (selfLid && selfLid !== me && (chats.has(selfLid) || chats.has(me))) {
+        // Collapse pre-fix dual self-chat state immediately, before either a
+        // human or linked automation can dispatch another task.
+        getChat(selfLid, config.workdir);
+      }
       log.info(`✅ Bridge live. Connected as ${me}`);
       log.info(`Working dir: ${config.workdir}`);
       log.info(
@@ -896,8 +995,10 @@ async function startInner() {
       if (config.commandPrefix) log.info(`Command prefix: "${config.commandPrefix}"`);
       log.info(
         config.mentionEnabled
-          ? `Mention triggers (any chat, fromMe only): ` +
-              config.mentionTriggers.map((t) => `"${t.trigger}"→${t.provider}`).join(", ")
+          ? `Mention triggers (fromMe only; must lead ordinary-chat messages): ` +
+              config.mentionTriggers
+                .map((t) => `"${t.trigger}"→${t.provider}${t.model ? `/${t.model}` : ""}`)
+                .join(", ")
           : `Mention trigger: disabled.`,
       );
       log.info("Ready. Control commands: /new  /cd <path>  /use <provider>  /status");
@@ -1022,6 +1123,10 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
 
   // ── Never react to our own replies (prevents an echo loop) ──
   if (msg.key.id && sentIds.has(msg.key.id)) return;
+  const inboundText = extractText(msg) ?? "";
+  // Content-level fallback for linked-device syncs that rewrite message IDs.
+  // The marker is attached to every bridge/API text frame on the wire.
+  if (msg.key.fromMe && hasAutomationMarker(inboundText)) return;
 
   // ── Never handle the same incoming message twice ──
   // WhatsApp redelivers messages whose receipt ack didn't make it out before
@@ -1036,6 +1141,12 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   // Placed after the sentIds check: bridge/API-sent messages are already
   // recorded at send time, so their echoes must not double-record.
   persistMessage(msg, remoteJid);
+
+  // fromMe means "sent by this WhatsApp account", not "typed by the human".
+  // Nora and other linked automations therefore pass the owner gate. Preserve
+  // their message in history, but never route a visibly bot-authored reply as
+  // a new task (in ordinary chats OR monitored command groups).
+  if (msg.key.fromMe && hasBotReplyPrefix(inboundText, config.botReplyPrefixes)) return;
 
   // ── HARD LOCK (dedicated group) ─────────────────────────────
   // The bridge only runs full unprompted tasks inside the groups it
@@ -1078,7 +1189,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   }
   if (!body && !attachment) return;
 
-  const reply = (text: string) => safeSend(remoteJid, text);
+  const bridgeReply = (text: string) => safeSend(remoteJid, prefixReply("Bridge", text));
 
   const chat = getChat(remoteJid, groupCfg.workdir);
 
@@ -1090,7 +1201,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
       chat.sessions = {}; // clear every provider's session for this chat
       chat.generation++; // a running task's completion must not restore the old session
       persistChats();
-      await reply("🆕 Started a fresh session.");
+      await bridgeReply("🆕 Started a fresh session.");
     } else if (cmd === "cd") {
       if (arg) {
         // Validate before accepting — a typo'd cwd makes every later spawn fail.
@@ -1101,16 +1212,16 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
           /* missing */
         }
         if (!isDir) {
-          await reply(`⚠️ Not a directory (or doesn't exist):\n${arg}\nWorking dir unchanged.`);
+          await bridgeReply(`⚠️ Not a directory (or doesn't exist):\n${arg}\nWorking dir unchanged.`);
         } else {
           chat.cwd = arg;
           chat.sessions = {}; // cwd changed — every provider's session is invalid
           chat.generation++;
           persistChats();
-          await reply(`📁 Working dir set to:\n${arg}\n(session reset)`);
+          await bridgeReply(`📁 Working dir set to:\n${arg}\n(session reset)`);
         }
       } else {
-        await reply(`📁 Current working dir:\n${chat.cwd}`);
+        await bridgeReply(`📁 Current working dir:\n${chat.cwd}`);
       }
     } else if (cmd === "use") {
       const name = arg.toLowerCase();
@@ -1122,41 +1233,44 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
             return `• ${n}${p.available() ? "" : " (not installed)"} — ${p.blurb}`;
           })
           .join("\n");
-        await reply(`Pick a provider: /use <name>\n\n${list}`);
+        await bridgeReply(`Pick a provider: /use <name>\n\n${list}`);
       } else {
         chat.provider = name;
         delete chat.sessions[name]; // fresh session for the provider being switched to
         chat.generation++;
         persistChats();
-        await reply(
+        await bridgeReply(
           `🔁 Switched to *${name}*${next.available() ? "" : " — ⚠ not installed on this machine"}.\n` +
             `(session reset)`,
         );
       }
     } else if (cmd === "status") {
-      await reply(
+      await bridgeReply(
         `📊 Status\nProvider: ${chat.provider}\nDir: ${chat.cwd}\n` +
           `Session: ${chat.sessions[chat.provider] ?? "none (fresh)"}\nBusy: ${chat.busy}`,
       );
     } else {
-      await reply("Unknown command. Available: /new  /cd <path>  /use <provider>  /status");
+      await bridgeReply("Unknown command. Available: /new  /cd <path>  /use <provider>  /status");
     }
     return;
   }
 
   // ── Run the task ───────────────────────────────────────────
-  if (chat.busy) {
-    await reply("⏳ Still working on the previous task — send it again once I reply.");
-    return;
-  }
   const providerName = matched?.provider ?? chat.provider;
   const provider = getProvider(providerName);
   if (!provider) {
-    await reply(`⚠️ Unknown provider "${providerName}". Use /use <name> to pick one.`);
+    await bridgeReply(`⚠️ Unknown provider "${providerName}". Use /use <name> to pick one.`);
+    return;
+  }
+  const sourceLabel = agentReplyLabel(matched?.trigger, provider.name);
+  const agentReply = (text: string) => safeSend(remoteJid, prefixReply(sourceLabel, text));
+  if (msg.key.fromMe && !(await allowTaskAttempt(remoteJid))) return;
+  if (chat.busy) {
+    await sendBusyNotice(remoteJid);
     return;
   }
   if (!ensureCwdValid(chat, groupCfg.workdir)) {
-    await reply(
+    await bridgeReply(
       `⚠️ Working dir is missing (and the configured fallback too):\n${groupCfg.workdir}\nRestore it or /cd to an existing directory.`,
     );
     return;
@@ -1170,9 +1284,14 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   chat.busy = true;
   const gen = chat.generation;
   const taskCwd = chat.cwd;
-  // Resume the session for this task's selected provider (per-provider
-  // sessions keep @codex and @computer independent in the same group).
-  const sessionAtDispatch = chat.sessions[provider.name];
+  // Explicit call signs own separate sessions, even if they use the same
+  // provider. Plain group tasks retain the legacy provider-keyed session.
+  const claimedSession = matched
+    ? getMentionSession(chat.sessions, matched)
+    : { key: provider.name, sessionId: chat.sessions[provider.name], migratedLegacy: false };
+  const sessionKey = claimedSession.key;
+  const sessionAtDispatch = claimedSession.sessionId;
+  if (claimedSession.migratedLegacy) persistChats();
   const inboxDir = join(taskCwd, "inbox");
   const outboxRoot = join(taskCwd, "outbox");
   // Per-task private outbox: concurrent tasks sharing a workdir must never
@@ -1183,7 +1302,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
 
   // Presence resolves the CURRENT socket — a long task outlives reconnects.
   await currentSock?.sendPresenceUpdate("composing", remoteJid).catch(() => {});
-  if (warn) await reply(warn);
+  if (warn) await bridgeReply(warn);
 
   // ── Download any attached file into the working dir's inbox ────────
   let filePath: string | undefined;
@@ -1194,12 +1313,12 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
       filePath = await saveIncoming(liveSock, msg, attachment, inboxDir);
     } catch (e: any) {
       log.error(`[${remoteJid}] download failed: ${e?.message ?? e}`);
-      await reply(`⚠️ Couldn't download that file: ${e?.message ?? e}`);
+      await bridgeReply(`⚠️ Couldn't download that file: ${e?.message ?? e}`);
       chat.busy = false;
       return;
     }
   }
-  await reply("🤖 On it...");
+  await bridgeReply("🤖 On it...");
 
   // ── Compose the task: caption + file note + outbox capability ──────
   let task = body;
@@ -1232,16 +1351,19 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     mkdirSync(taskOutbox, { recursive: true });
     const res = await provider.run(
       task,
-      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.modelFor(provider.name) },
+      {
+        cwd: taskCwd,
+        resumeSessionId: sessionAtDispatch,
+        model: matched?.model ?? config.modelFor(provider.name),
+      },
       config.taskTimeoutMs,
     );
-    // Session writeback (keyed by provider) only if no control command changed
-    // state meanwhile — otherwise a /new (or /use's provider switch) issued
-    // mid-task would be silently undone. Per-provider sessions also mean a
-    // claude id can no longer be stored under provider=codex.
+    // Session writeback (keyed by call sign when explicitly routed, otherwise
+    // provider) only if no control command changed state meanwhile — otherwise
+    // a /new or /use issued mid-task would be silently undone.
     if (chat.generation === gen) {
-      if (res.resetSession) delete chat.sessions[provider.name]; // stale --resume id recovered
-      if (res.sessionId) chat.sessions[provider.name] = res.sessionId;
+      if (res.resetSession) delete chat.sessions[sessionKey]; // stale --resume id recovered
+      if (res.sessionId) chat.sessions[sessionKey] = res.sessionId;
       persistChats();
     }
     const secs = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -1257,17 +1379,17 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
       // The agent was SIGKILLed mid-flight — anything in its outbox may be a
       // truncated partial write. Hold, never deliver.
       const held = orphanTaskOutbox(taskOutbox, outboxRoot);
-      await reply(
+      await bridgeReply(
         "⚠️ " + res.text + (held ? "\n📎 Files it was writing were held (not sent) — see outbox/.orphaned/." : ""),
       );
     } else {
-      await reply((res.isError ? "⚠️ " : "") + res.text);
+      await agentReply((res.isError ? "⚠️ " : "") + res.text);
       // ── Deliver any files the agent left in ITS outbox (current socket) ──
       const liveSock = currentSock;
       if (liveSock) {
         const delivered = await flushOutbox(liveSock, remoteJid, taskOutbox, rememberSent);
         removeTaskOutbox(taskOutbox);
-        if (delivered) await reply(delivered.summary);
+        if (delivered) await bridgeReply(delivered.summary);
       } else {
         orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
       }
@@ -1276,7 +1398,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     log.error(`[${remoteJid}] bridge error: ${e?.message ?? e}`);
     taskFinished(rec, { status: "error" });
     orphanTaskOutbox(taskOutbox, outboxRoot);
-    await reply(`💥 Bridge error: ${e?.message ?? e}`);
+    await bridgeReply(`💥 ${e?.message ?? e}`);
   } finally {
     cwdTaskFinished(taskCwd);
     chat.busy = false;
