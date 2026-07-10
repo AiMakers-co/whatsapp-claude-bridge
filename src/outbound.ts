@@ -23,12 +23,43 @@ import { markAutomated, stripAutomationMarker } from "./replies.js";
  * echo past the sentIds filter and run as a task.
  */
 
+export interface SendGuard {
+  /** Canonical logical chat key (PN/LID aliases collapse to one key). */
+  chatKey: string;
+  /** Chat-state generation captured when the task reached the queue head. */
+  generation: number;
+  /** Lane this reply belongs to (call-sign session key / provider) — G1. */
+  laneId?: string;
+  /** The lane's generation captured at dispatch; a sticky /new bumps only its
+   * own lane, so another agent's running reply stays deliverable. */
+  laneGeneration?: number;
+}
+
+/**
+ * safeSend outcome. `delivered` keeps the old boolean contract (true = sent or
+ * durably queued for later delivery; false = cancelled by an invalid guard, or
+ * couldn't be queued). `ids` are the WhatsApp message ids assigned to each
+ * chunk (stable across retries and queue flushes) so a caller can record the
+ * reply in the transcript store by id — see recordAgentReply (F7). `sentIds`
+ * is the subset actually delivered on the live socket in THIS call: a chunk
+ * queued to pending-sends keeps its id in `ids` but not in `sentIds` (its
+ * store row only appears when the queue flushes later). Callers use an empty
+ * `sentIds` to detect the fully-queued offline case (R4).
+ */
+export interface SendResult {
+  delivered: boolean;
+  ids: string[];
+  sentIds: string[];
+}
+
 interface OutboundDeps {
   getSock: () => WASocket | undefined;
   isConnected: () => boolean;
   rememberSent: (id?: string | null) => void;
   /** True once WhatsApp permanently logged this session out (401). */
   loggedOut: () => boolean;
+  /** False once /stop, /new, /cd or /use invalidates a task-owned reply. */
+  isGuardValid: (guard: SendGuard) => boolean;
 }
 
 let deps: OutboundDeps | undefined;
@@ -47,6 +78,8 @@ interface PendingSend {
   ts: number; // unix ms when the send was queued
   /** Pre-generated WhatsApp message id, reused on every flush retry. */
   id?: string;
+  /** Task-owned replies are discarded once their chat generation changes. */
+  guard?: SendGuard;
 }
 
 /** Total time safeSend waits for reconnection/retries before queueing. */
@@ -62,6 +95,16 @@ const DRAIN_INTERVAL_MS = 20_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function guardIsValid(guard?: SendGuard): boolean {
+  if (!guard) return true;
+  try {
+    return Boolean(deps?.isGuardValid(guard));
+  } catch (e: any) {
+    log.warn(`outbound guard check failed: ${e?.message ?? e}`);
+    return false;
+  }
 }
 
 /**
@@ -113,6 +156,7 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
   // Persist our own outgoing reply (echoes are filtered via sentIds, so
   // recording here is the only place this message is ever stored).
   recordMessage(jid, {
+    id,
     ts: Math.floor(Date.now() / 1000),
     fromMe: true,
     sender: jidNormalizedUser(sock.user?.id ?? ""),
@@ -122,13 +166,21 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
   touchContact(jid);
 }
 
-/** Retry within the window, waiting out disconnects. True = delivered. */
-async function sendWithRetry(jid: string, text: string, id: string): Promise<boolean> {
+type SendOutcome = "sent" | "failed" | "cancelled";
+
+/** Retry within the window, waiting out disconnects. */
+async function sendWithRetry(
+  jid: string,
+  text: string,
+  id: string,
+  guard?: SendGuard,
+): Promise<SendOutcome> {
   const deadline = Date.now() + SEND_WINDOW_MS;
   while (Date.now() < deadline) {
+    if (!guardIsValid(guard)) return "cancelled";
     // Permanently logged out (401): nothing will reconnect — fail fast to the
     // queue instead of burning the full window per chunk.
-    if (deps?.loggedOut()) return false;
+    if (deps?.loggedOut()) return "failed";
     // If we're disconnected, don't burn attempts — wait for the reconnect
     // loop (index.ts) to bring the socket back, then try again.
     if (!deps?.isConnected()) {
@@ -136,14 +188,15 @@ async function sendWithRetry(jid: string, text: string, id: string): Promise<boo
       continue;
     }
     try {
+      if (!guardIsValid(guard)) return "cancelled";
       await sendOnce(jid, text, id);
-      return true;
+      return "sent";
     } catch (e: any) {
       log.warn(`send to ${jid} failed (${e?.message ?? e}) — retrying...`);
       await sleep(POLL_MS);
     }
   }
-  return false;
+  return guardIsValid(guard) ? "failed" : "cancelled";
 }
 
 // ── On-disk queue (in-memory canonical copy, persisted synchronously) ───────
@@ -186,11 +239,32 @@ function persistQueue(): void {
   }
 }
 
+/**
+ * Synchronously remove task-owned replies invalidated by a control command.
+ * This closes the restart window: a stale entry cannot survive on disk until
+ * the next process even if the app is restarted immediately after /stop.
+ */
+export function discardInvalidPending(): number {
+  const q = loadQueue();
+  const kept = q.filter((entry) => guardIsValid(entry.guard));
+  const removed = q.length - kept.length;
+  if (removed) {
+    queue = kept;
+    persistQueue();
+    log.info(`Discarded ${removed} invalidated pending task repl${removed === 1 ? "y" : "ies"}.`);
+  }
+  return removed;
+}
+
 /** Append a failed send to the queue (survives restarts). Never throws. */
-function enqueuePending(jid: string, text: string, id: string): void {
+function enqueuePending(jid: string, text: string, id: string, guard?: SendGuard): boolean {
+  if (!guardIsValid(guard)) {
+    log.info(`Discarded cancelled task reply to ${jid} before pending-send enqueue.`);
+    return false;
+  }
   try {
     const q = loadQueue();
-    q.push({ jid, text, ts: Date.now(), id });
+    q.push({ jid, text, ts: Date.now(), id, ...(guard ? { guard } : {}) });
     if (q.length > QUEUE_MAX) {
       const dropped = q.splice(0, q.length - QUEUE_MAX);
       for (const d of dropped) {
@@ -202,9 +276,11 @@ function enqueuePending(jid: string, text: string, id: string): void {
     persistQueue();
     log.warn(`send to ${jid} queued to pending-sends.jsonl after retries exhausted`);
     scheduleDrain();
+    return true;
   } catch (e: any) {
     // Truly last-resort: nowhere left to put it — log the loss loudly.
     log.error(`DROPPED message to ${jid} (queue write failed: ${e?.message ?? e})`);
+    return false;
   }
 }
 
@@ -234,9 +310,18 @@ function scheduleDrain(): void {
  * Chunk-order invariant: once one chunk is queued, every later chunk of the
  * same message is queued too — a later chunk never overtakes an earlier one.
  */
-export async function safeSend(jid: string, text: string): Promise<void> {
+export async function safeSend(
+  jid: string,
+  text: string,
+  options: { guard?: SendGuard } = {},
+): Promise<SendResult> {
+  const { guard } = options;
+  const ids: string[] = [];
+  const sentIds: string[] = [];
+  if (!guardIsValid(guard)) return { delivered: false, ids, sentIds };
   let queueRest = false;
   for (const part of chunkForWhatsApp(text)) {
+    if (!guardIsValid(guard)) return { delivered: false, ids, sentIds };
     // Per-jid ordering across CALLS too: if earlier messages to this chat are
     // still queued, a live send now would overtake them — queue behind them.
     if (!queueRest && loadQueue().some((e) => e.jid === jid)) queueRest = true;
@@ -245,17 +330,24 @@ export async function safeSend(jid: string, text: string): Promise<void> {
     // reuses the id so WhatsApp dedupes server-side.
     const id = generateMessageID();
     deps?.rememberSent(id);
+    ids.push(id);
     if (!queueRest) {
       try {
-        if (await sendWithRetry(jid, part, id)) continue;
+        const outcome = await sendWithRetry(jid, part, id, guard);
+        if (outcome === "sent") {
+          sentIds.push(id);
+          continue;
+        }
+        if (outcome === "cancelled") return { delivered: false, ids, sentIds };
       } catch (e: any) {
         // sendWithRetry shouldn't throw, but safeSend's contract is absolute.
         log.error(`safeSend unexpected failure for ${jid}: ${e?.message ?? e}`);
       }
       queueRest = true;
     }
-    enqueuePending(jid, part, id);
+    if (!enqueuePending(jid, part, id, guard)) return { delivered: false, ids, sentIds };
   }
+  return { delivered: true, ids, sentIds };
 }
 
 let flushing = false;
@@ -292,12 +384,18 @@ async function flushQueueOnce(): Promise<void> {
   // TTL: a backlog from a dead period must not dump days-old messages into
   // chats where they are no longer wanted.
   const cutoff = Date.now() - QUEUE_TTL_MS;
-  const expired = q.filter((e) => (e.ts ?? 0) < cutoff);
-  if (expired.length) {
-    for (const e of expired) {
-      log.warn(`Dropping expired (>24h) queued send to ${e.jid}: ${e.text.slice(0, 80)}`);
+  const expiredOrCancelled = q.filter(
+    (e) => (e.ts ?? 0) < cutoff || !guardIsValid(e.guard),
+  );
+  if (expiredOrCancelled.length) {
+    for (const e of expiredOrCancelled) {
+      if ((e.ts ?? 0) < cutoff) {
+        log.warn(`Dropping expired (>24h) queued send to ${e.jid}: ${e.text.slice(0, 80)}`);
+      } else {
+        log.info(`Dropping cancelled queued task reply to ${e.jid}.`);
+      }
     }
-    queue = q.filter((e) => (e.ts ?? 0) >= cutoff);
+    queue = q.filter((e) => (e.ts ?? 0) >= cutoff && guardIsValid(e.guard));
     persistQueue();
   }
   let delivered = 0;
@@ -310,6 +408,14 @@ async function flushQueueOnce(): Promise<void> {
   for (const entry of [...loadQueue()]) {
     if (!deps?.isConnected()) break;
     if (failedJids.has(entry.jid)) continue;
+    if (!guardIsValid(entry.guard)) {
+      const cur = loadQueue();
+      const i = cur.indexOf(entry);
+      if (i >= 0) cur.splice(i, 1);
+      persistQueue();
+      log.info(`Dropping cancelled queued task reply to ${entry.jid}.`);
+      continue;
+    }
     if (!entry.id) {
       // Legacy entry from before ids were persisted — assign one now so the
       // echo filter and server-side dedupe still apply.

@@ -301,7 +301,7 @@ export const html = `<!DOCTYPE html>
   <span id="me" class="kv mono"></span>
   <span class="kv">up <b id="uptime">–</b></span>
   <span class="kv">reconnects <b id="reconnects">–</b></span>
-  <span class="badge zero" id="pending">queue 0</span>
+  <span class="badge zero" id="pending">queues 0</span>
   <span class="kv mono" id="provider"></span>
   <span class="spacer"></span>
   <button id="settings-btn" title="bridge settings">&#9881; settings</button>
@@ -466,8 +466,10 @@ export const html = `<!DOCTYPE html>
       $("uptime").textContent = dur(s.uptimeSec * 1000);
       $("reconnects").textContent = s.reconnects;
       var p = $("pending");
-      p.textContent = "queue " + s.pendingSends;
-      p.className = "badge" + (s.pendingSends ? "" : " zero");
+      var queued = (s.pendingSends || 0) + (s.queuedTurns || 0) + (s.activeTurns || 0);
+      p.textContent = "send q " + (s.pendingSends || 0) + " · turns " +
+        (s.activeTurns || 0) + "+" + (s.queuedTurns || 0);
+      p.className = "badge" + (queued ? "" : " zero");
       $("provider").textContent = s.provider + (s.model ? ":" + s.model : "") + " @ " + s.workdir;
 
       var banner = $("banner");

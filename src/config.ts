@@ -111,6 +111,42 @@ const taskTimeoutMs = Math.max(rawTimeoutMs, 30_000);
 if (taskTimeoutMs !== rawTimeoutMs) {
   console.warn(`TASK_TIMEOUT_SECONDS too low (${rawTimeoutMs / 1000}s) — clamped to 30s minimum.`);
 }
+
+/**
+ * Blank (unset, or "" saved by the settings UI) defaults to 120 like the other
+ * numerics — it must NOT silently become 0/disabled. Only an explicit "0"
+ * disables sticky mode; other invalid values warn and fall back to 120.
+ * Exported for tests (config's env is read only once, at module load).
+ */
+export function parseConversationMinutes(
+  raw: string | undefined,
+  warn: (message: string) => void = console.warn,
+): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return 120;
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || n < 0) {
+    warn(`CONVERSATION_MODE_MINUTES invalid (${trimmed}) — using 120.`);
+    return 120;
+  }
+  const clamped = Math.min(n, 10_080);
+  if (clamped !== n) {
+    warn(`CONVERSATION_MODE_MINUTES too high (${n}) — clamped to 10080 (7 days).`);
+  }
+  return clamped;
+}
+
+const conversationMinutes = parseConversationMinutes(process.env.CONVERSATION_MODE_MINUTES);
+const rawConversationQueueLimit = Number(process.env.CONVERSATION_QUEUE_LIMIT ?? 10);
+const conversationQueueLimit =
+  Number.isInteger(rawConversationQueueLimit) && rawConversationQueueLimit >= 1
+    ? Math.min(rawConversationQueueLimit, 50)
+    : 10;
+if (conversationQueueLimit !== rawConversationQueueLimit) {
+  console.warn(
+    `CONVERSATION_QUEUE_LIMIT invalid (${process.env.CONVERSATION_QUEUE_LIMIT}) — using ${conversationQueueLimit}.`,
+  );
+}
 const rawApiPort = Number(process.env.WA_API_PORT) || 8477;
 const apiPort = Number.isInteger(rawApiPort) && rawApiPort >= 1 && rawApiPort <= 65535 ? rawApiPort : 8477;
 if (apiPort !== rawApiPort) {
@@ -179,6 +215,12 @@ export const config = {
 
   /** Hard timeout per task in milliseconds (clamped to >= 30s above). */
   taskTimeoutMs,
+
+  /** Sliding sticky-conversation lifetime; 0 disables sticky mode. */
+  conversationModeMs: conversationMinutes * 60_000,
+
+  /** Maximum turns waiting behind one active task in a chat. */
+  conversationQueueLimit,
 
   /** Auto-open the QR image in the OS viewer while linking. */
   qrAutoOpen: (process.env.QR_AUTO_OPEN ?? "true").toLowerCase() !== "false",

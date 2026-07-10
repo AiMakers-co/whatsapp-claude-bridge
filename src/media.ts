@@ -218,7 +218,9 @@ export async function flushOutbox(
   jid: string,
   outboxDir: string,
   markSent: (id?: string | null) => void = () => {},
+  isValid: () => boolean = () => true,
 ): Promise<OutboxResult | null> {
+  if (!isValid()) return null;
   let names: string[];
   try {
     names = readdirSync(outboxDir).filter((f) => !f.startsWith("."));
@@ -230,6 +232,7 @@ export async function flushOutbox(
   const sent: string[] = [];
   const skipped: string[] = [];
   for (const name of names) {
+    if (!isValid()) break;
     const path = join(outboxDir, name);
     let size = 0;
     try {
@@ -253,6 +256,7 @@ export async function flushOutbox(
     const ext = extname(name).toLowerCase();
     const mimetype = EXT_MIME[ext] ?? "application/octet-stream";
     try {
+      if (!isValid()) break;
       // Pre-generate + remember the id BEFORE sending: a delivered-but-
       // rejected send must not slip its echo past the sentIds filter.
       const id = generateMessageID();

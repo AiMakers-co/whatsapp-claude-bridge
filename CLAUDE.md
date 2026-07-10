@@ -32,7 +32,8 @@ There are two independent trigger paths, both in `index.ts`:
    `@computer:claude:sonnet,@codex:codex:gpt-5.6`; model suffixes are optional
    and sessions are independent per call sign per chat. In ordinary chats the
    trigger must be the first token; monitored groups retain an anywhere-token
-   provider override. See "Hard rules" below.
+   provider override. A self-chat trigger starts a sliding sticky conversation;
+   other ordinary chats require explicit `@call-sign /chat`. See "Hard rules".
 
 ## Setup procedure — do this in order
 
@@ -55,7 +56,7 @@ There are two independent trigger paths, both in `index.ts`:
    Devices → Link a Device, and scan the QR code in the terminal." You cannot do
    this step — it requires their physical phone. Wait for the `✅ Bridge live` line.
 6. **Verify:** tell them to open the chat **with themselves** (search their own
-   name / "(You)") and send a test like `what files are in this directory?`.
+   name / "(You)") and send a test like `@computer what files are in this directory?`.
    They should get a reply. If they set a `COMMAND_PREFIX`, the test must start
    with it.
 7. **Offer to make it permanent.** The bridge only runs while the terminal is open.
@@ -67,13 +68,37 @@ There are two independent trigger paths, both in `index.ts`:
 
 ## How the user drives it once live
 
-- Any normal message = a task for Claude, run in `WORKDIR`.
-- `/new` — start a fresh session (drops conversation memory).
-- `/cd <path>` — switch the working directory for this chat (resets the session).
-- `/use <provider>` — switch agent CLI (claude/codex/gemini/grok) for this chat.
-- `/status` — show provider, current dir, session id, and whether a task is running.
-- One task runs at a time per chat; a second message while busy is rejected with a
-  nudge rather than queued.
+- In a dedicated group, any authorised normal message is a task. In self-chat,
+  start with a call sign once and then continue normally during sticky mode.
+- `/new` — start a fresh session (drops conversation memory). In a command
+  group it resets EVERY provider's session; in a sticky chat only that call
+  sign's session.
+- `/chat` — explicitly activate sticky mode outside self-chat.
+- `/stop` — end sticky mode and clear waiting turns.
+- `/cd <path>` — switch the working directory for this chat (resets the
+  session). Works in command groups and sticky chats.
+- `/use <provider>` — switch agent CLI (claude/codex/gemini/grok) for this
+  chat. Works in command groups and sticky chats.
+- `/status` — show provider, current dir, session state, and per-agent lane activity.
+- Known commands never run as agent tasks — even with trailing words
+  ("/stop now") or an attachment. In command groups NO `/`-leading message
+  ever runs as a task; in sticky chats, unknown `/`-text stays conversational.
+- Each agent (call sign in ordinary chats, provider in command groups) is an
+  independent execution LANE per chat: `@computer` and `@codex` in one chat run
+  CONCURRENTLY, like separate terminals. Within one lane, turns stay strictly
+  FIFO (turn N+1 sees turn N's result) in a bounded queue. Queueing is silent —
+  no position notices.
+- The strict burst breaker is keyed per lane (3 hits/30s, 2-min pause, per
+  agent per chat), so parallel agents don't consume each other's budget; the
+  total burst per chat stays bounded at 3 x the configured call signs per
+  window. The sticky-conversation breaker (8/30s) stays per chat. All other
+  loop barriers are unchanged.
+- On a loop-guard trip, every lane's queued turns in that chat are cleared and
+  sticky mode ends (only the tripped lane is paused — the notice names it by
+  label), but tasks already running still deliver. Only explicit user resets
+  cancel a running task's delivery: /stop, /cd, /use (and group /new) are
+  chat-wide; a sticky /new cancels only its OWN call sign's lane, so the other
+  agent's running turn keeps delivering and keeps its session.
 
 ## Run it 24/7
 
@@ -105,11 +130,14 @@ first.
 - The mention triggers (`ENABLE_MENTION_TRIGGER`, `MENTION_TRIGGER`, and
   `MENTION_TRIGGERS` in `.env`) are an intentional, narrow exception the user
   explicitly asked for: they reply in ANY chat, but are strictly fromMe-gated.
+  Sticky follow-ups are allowed automatically only in self-chat; every other
+  ordinary chat requires an explicit `/chat` activation with a sliding expiry.
 - `fromMe` includes every linked automation using the owner's WhatsApp account,
   not just human typing. Preserve all loop barriers: visible source prefixes,
   the invisible outbound marker, bot-prefix suppression, leading-only ordinary
-  triggers, PN/LID self-chat canonicalization, busy throttling, and the burst
-  circuit breaker. Never interpolate a live trigger token into a busy notice.
+  triggers, PN/LID self-chat canonicalization, bounded per-chat FIFO, and the
+  burst circuit breakers. Never interpolate a live trigger token into an
+  operational notice.
   This is not a bug and not scope creep to be reverted — if asked to touch
   this area again, preserve the fromMe-only invariant above all else.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that

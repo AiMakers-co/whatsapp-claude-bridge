@@ -1,8 +1,18 @@
-import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFile, rename, writeFile } from "node:fs/promises";
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { resolve, join } from "node:path";
 import { config } from "./config.js";
 import { log } from "./logger.js";
+import type { ActiveConversation } from "./conversation-mode.js";
 
 /**
  * Lightweight persistent message store. Every incoming + outgoing message
@@ -34,7 +44,11 @@ const groupsFile = join(dataDir, "groups.json");
  * ...) is transient environment trouble, not corruption — the file may be
  * perfectly valid, so it is left untouched and only logged.
  */
-function loadJsonSafe<T>(file: string, label: string): T | undefined {
+export function loadJsonSafe<T>(
+  file: string,
+  label: string,
+  reviver?: (key: string, value: any) => any,
+): T | undefined {
   let raw: string;
   try {
     raw = readFileSync(file, "utf8");
@@ -45,14 +59,16 @@ function loadJsonSafe<T>(file: string, label: string): T | undefined {
     return undefined;
   }
   try {
-    return JSON.parse(raw) as T;
+    return JSON.parse(raw, reviver) as T;
   } catch (e: any) {
+    // Genuine on-disk corruption (unlike a transient read error above): move it
+    // aside for inspection and start fresh. Logged at ERROR — data was lost.
     const aside = `${file}.corrupt-${Date.now()}`;
     try {
       renameSync(file, aside);
-      log.warn(`${label} was corrupt — moved to ${aside}, starting fresh: ${e?.message ?? e}`);
+      log.error(`${label} was corrupt — moved to ${aside}, starting fresh: ${e?.message ?? e}`);
     } catch {
-      log.warn(`${label} was corrupt and could not be moved aside: ${e?.message ?? e}`);
+      log.error(`${label} was corrupt and could not be moved aside: ${e?.message ?? e}`);
     }
     return undefined;
   }
@@ -80,11 +96,14 @@ export function flushAllNow(): void {
   }
 }
 
-function debouncedAtomicSaver<T>(file: string, label: string): (data: T) => void {
+/** A debounced saver, plus a `flushNow` to write any pending snapshot at once. */
+type DebouncedSaver<T> = ((data: T) => void) & { flushNow: () => void };
+
+function debouncedAtomicSaver<T>(file: string, label: string): DebouncedSaver<T> {
   let timer: NodeJS.Timeout | null = null;
   let latest: T;
   let writing: Promise<void> = Promise.resolve();
-  pendingFlushers.push(() => {
+  const flushNow = () => {
     if (!timer) return; // nothing pending
     clearTimeout(timer);
     timer = null;
@@ -96,10 +115,19 @@ function debouncedAtomicSaver<T>(file: string, label: string): (data: T) => void
       writeFileSync(tmp, JSON.stringify(latest, null, 2));
       renameSync(tmp, file);
     } catch (e: any) {
-      log.warn(`${label} exit flush failed: ${e?.message ?? e}`);
+      log.warn(`${label} flush failed: ${e?.message ?? e}`);
     }
-  });
-  return (data: T) => {
+    // A debounced async write already in flight could rename OLDER data over
+    // this sync write when it settles. Chain one confirming write behind it so
+    // the final on-disk state is always the latest snapshot. (On the exit path
+    // the chained write never runs — the sync write above already landed.)
+    writing = writing
+      .then(() => writeFile(`${file}.tmp`, JSON.stringify(latest, null, 2)))
+      .then(() => rename(`${file}.tmp`, file))
+      .catch((e) => log.warn(`${label} save failed: ${e?.message ?? e}`));
+  };
+  pendingFlushers.push(flushNow);
+  const save = (data: T) => {
     latest = data;
     if (timer) return;
     timer = setTimeout(() => {
@@ -115,9 +143,11 @@ function debouncedAtomicSaver<T>(file: string, label: string): (data: T) => void
     // Never keep the process alive just for a pending save.
     timer.unref?.();
   };
+  return Object.assign(save, { flushNow });
 }
 
 export interface StoredMessage {
+  id?: string; // WhatsApp message id (snapshot ordering / dedupe)
   ts: number; // unix seconds
   fromMe: boolean;
   sender: string; // jid of the author
@@ -158,7 +188,7 @@ function scheduleContactsSave(): void {
 // restart echo-reprocess hole, groups.json pins resolved group JIDs so a
 // rename or subject clash can never trigger duplicate group creation.
 
-/** Serializable slice of per-chat state (never `busy` — that's runtime-only). */
+/** Serializable slice of per-chat state. */
 export interface PersistedChat {
   /**
    * Legacy single resume id (pre per-provider sessions). Still READ on load so
@@ -171,6 +201,12 @@ export interface PersistedChat {
    * explicit mention routes. The provider key remains a legacy fallback.
    */
   sessions?: Record<string, string>;
+  /** Sliding sticky-chat state; route provider/model resolve from live config. */
+  conversation?: ActiveConversation;
+  /** Persisted invalidation epoch for guarded task replies and queued sends. */
+  generation?: number;
+  /** Per-lane invalidation epochs (G1): a sticky /new bumps only its lane. */
+  laneGenerations?: Record<string, number>;
   cwd: string;
   provider: string;
 }
@@ -291,6 +327,12 @@ export function recordMessage(jid: string, m: StoredMessage): void {
   });
 }
 
+/** Wait until every message already queued for this chat is on disk. */
+export async function waitForMessageWrites(jid: string): Promise<void> {
+  const file = join(messagesDir, sanitizeJid(jid) + ".jsonl");
+  await (appendChains.get(file) ?? Promise.resolve());
+}
+
 export interface ChatSummary {
   jid: string;
   name: string;
@@ -310,25 +352,45 @@ export function listChats(): ChatSummary[] {
     .sort((a, b) => b.lastTs - a.lastTs);
 }
 
-/** Last `limit` stored messages for a jid (empty array if none). */
+/**
+ * Last `limit` stored messages for a jid (empty array if none). Reads only the
+ * final ~256 KB of the JSONL rather than the whole file — a long-lived chat's
+ * log grows without bound, and the transcript only ever needs the tail. The
+ * first line of a mid-file read is almost always truncated, so it's dropped.
+ */
+const HISTORY_TAIL_BYTES = 256 * 1024;
+
 export async function readHistory(jid: string, limit = 50): Promise<StoredMessage[]> {
+  const file = join(messagesDir, sanitizeJid(jid) + ".jsonl");
+  let raw: string;
+  let partialFirst = false;
   try {
-    const raw = await readFile(join(messagesDir, sanitizeJid(jid) + ".jsonl"), "utf8");
-    return raw
-      .split("\n")
-      .filter(Boolean)
-      .slice(-Math.max(1, limit))
-      .map((l) => {
-        try {
-          return JSON.parse(l) as StoredMessage;
-        } catch {
-          return null;
-        }
-      })
-      .filter((m): m is StoredMessage => m !== null);
+    const size = statSync(file).size;
+    const span = Math.min(size, HISTORY_TAIL_BYTES);
+    const buf = Buffer.alloc(span);
+    const fd = openSync(file, "r");
+    try {
+      readSync(fd, buf, 0, span, size - span);
+    } finally {
+      closeSync(fd);
+    }
+    raw = buf.toString("utf8");
+    partialFirst = span < size;
   } catch {
     return [];
   }
+  const lines = raw.split("\n").filter(Boolean);
+  if (partialFirst && lines.length > 1) lines.shift(); // drop the truncated head line
+  return lines
+    .slice(-Math.max(1, limit))
+    .map((l) => {
+      try {
+        return JSON.parse(l) as StoredMessage;
+      } catch {
+        return null;
+      }
+    })
+    .filter((m): m is StoredMessage => m !== null);
 }
 
 /**

@@ -14,7 +14,7 @@ export interface TaskRecord {
   preview: string;
   startedAt: number;
   endedAt?: number;
-  status: "running" | "done" | "error" | "timeout";
+  status: "running" | "done" | "error" | "timeout" | "cancelled";
   costUsd?: number;
   provider: string;
 }

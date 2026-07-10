@@ -38,6 +38,8 @@ interface ApiDeps {
   isConnected: () => boolean;
   /** True once WhatsApp logged the session out (auth/ must be re-linked). */
   loggedOut: () => boolean;
+  queuedTurns: () => number;
+  activeTurns: () => number;
   rememberSent: (id?: string | null) => void;
 }
 
@@ -211,6 +213,8 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
       model: config.modelFor(config.provider) ?? "",
       workdir: config.workdir,
       pendingSends: runtime.pendingSendsCount(),
+      queuedTurns: deps.queuedTurns(),
+      activeTurns: deps.activeTurns(),
       // newest first; explicit field map keeps the wire shape stable
       tasks: [...runtime.tasks].reverse().map((t) => ({
         jid: t.jid,
@@ -358,6 +362,40 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
     recordOutgoing(sock, target.jid, visibleText);
     log.info(`[api] sent text to ${target.jid} (${text.replace(/\s+/g, " ").slice(0, 120)})`);
     json(res, 200, { ok: true, jid: target.jid, id });
+    return;
+  }
+
+  // ── POST /delete { jid?|to?, id } — revoke (delete-for-everyone) ──
+  // Unsends a message THIS account sent, using its message id (the `id` that
+  // POST /send returns). WhatsApp only lets you revoke your own recent
+  // messages, so fromMe is fixed true — you can't delete someone else's.
+  if (route === "POST /delete") {
+    const body = await readBody(req);
+    const id = typeof body.id === "string" ? body.id.trim() : "";
+    if (!id) {
+      json(res, 400, { error: "id is required (the message id returned by /send)" });
+      return;
+    }
+    const target = resolveTarget(body.jid ?? body.to ?? "");
+    if (!("jid" in target)) {
+      json(res, target.status, { error: target.error, candidates: target.candidates });
+      return;
+    }
+    const sock = deps.getSock();
+    if (!sock || !deps.isConnected()) {
+      json(res, 503, { error: "bridge not connected to WhatsApp" });
+      return;
+    }
+    try {
+      // Baileys revoke: send a `delete` pointing at the original message key.
+      await sock.sendMessage(target.jid, {
+        delete: { remoteJid: target.jid, fromMe: true, id },
+      });
+      log.info(`[api] deleted message ${id} in ${target.jid}`);
+      json(res, 200, { ok: true, jid: target.jid, id, deleted: true });
+    } catch (e: any) {
+      json(res, 500, { error: `delete failed: ${e?.message ?? e}` });
+    }
     return;
   }
 

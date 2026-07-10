@@ -174,6 +174,22 @@ export const FIELDS: SettingField[] = [
     help: "Comma-separated prefixes from other automations that must never trigger agents. Nora:, Computer:, Codex: and Bridge: are always ignored.",
     placeholder: "e.g. Growth Bot:, SEO Agent:",
   },
+  {
+    key: "CONVERSATION_MODE_MINUTES",
+    label: "Conversation mode duration (minutes)",
+    type: "number",
+    group: "Mention trigger",
+    help: "After a call sign in your self-chat, follow-up messages keep talking to that agent without repeating the call sign. Other chats require an explicit /chat. Sliding timeout; 0 disables; blank uses the default (120).",
+    placeholder: "120",
+  },
+  {
+    key: "CONVERSATION_QUEUE_LIMIT",
+    label: "Queued follow-up limit",
+    type: "number",
+    group: "Mention trigger",
+    help: "Maximum turns kept waiting behind an agent task in the same chat, from 1 to 50.",
+    placeholder: "10",
+  },
   // ── Media ──
   {
     key: "MEDIA_STORE",
@@ -311,6 +327,26 @@ function validate(updates: Record<string, string>): Record<string, string> {
   const timeout = get("TASK_TIMEOUT_SECONDS");
   if (timeout && !(Number(timeout) > 0)) {
     errors.TASK_TIMEOUT_SECONDS = "Must be a positive number.";
+  }
+
+  const conversationMinutes = get("CONVERSATION_MODE_MINUTES");
+  if (
+    conversationMinutes &&
+    !(Number(conversationMinutes) >= 0 && Number(conversationMinutes) <= 10_080)
+  ) {
+    errors.CONVERSATION_MODE_MINUTES = "Must be between 0 and 10080 minutes.";
+  }
+
+  const conversationQueueLimit = get("CONVERSATION_QUEUE_LIMIT");
+  if (
+    conversationQueueLimit &&
+    !(
+      Number.isInteger(Number(conversationQueueLimit)) &&
+      Number(conversationQueueLimit) >= 1 &&
+      Number(conversationQueueLimit) <= 50
+    )
+  ) {
+    errors.CONVERSATION_QUEUE_LIMIT = "Must be a whole number from 1 to 50.";
   }
 
   const mediaMax = get("MEDIA_MAX_MB");

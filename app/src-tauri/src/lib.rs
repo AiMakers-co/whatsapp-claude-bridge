@@ -616,10 +616,19 @@ fn task_activity(app: &AppHandle) -> TaskActivity {
     let Some(tasks) = status.get("tasks").and_then(|tasks| tasks.as_array()) else {
         return TaskActivity::Unknown;
     };
-    let running = tasks
+    let running_tasks = tasks
         .iter()
         .filter(|task| task.get("status").and_then(|s| s.as_str()) == Some("running"))
         .count();
+    let active_turns = status
+        .get("activeTurns")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let queued_turns = status
+        .get("queuedTurns")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let running = running_tasks.max(active_turns) + queued_turns;
     if running == 0 {
         TaskActivity::Idle
     } else {

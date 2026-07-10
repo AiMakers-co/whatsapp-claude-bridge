@@ -1,3 +1,4 @@
+import "./helpers/test-home.js"; // must precede any src/config.js importer
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -10,7 +11,12 @@ import {
   prefixReply,
   stripAutomationMarker,
 } from "../src/replies.js";
-import { chunkForWhatsApp, delayedReplyText } from "../src/outbound.js";
+import {
+  chunkForWhatsApp,
+  delayedReplyText,
+  initOutbound,
+  safeSend,
+} from "../src/outbound.js";
 
 test("reply labels are deterministic and never doubled", () => {
   assert.equal(agentReplyLabel("@computer", "claude"), "Computer");
@@ -56,4 +62,66 @@ test("every long physical chunk retains its visible source prefix", () => {
 
   const numericCallSign = prefixReply("123", "c".repeat(8_500));
   assert.ok(chunkForWhatsApp(numericCallSign).every((part) => part.startsWith("123: ")));
+});
+
+test("invalidated task replies never reach the socket or pending queue", async () => {
+  let attempts = 0;
+  initOutbound({
+    getSock: () =>
+      ({
+        sendMessage: async () => {
+          attempts++;
+          return {};
+        },
+      }) as any,
+    isConnected: () => true,
+    rememberSent: () => {},
+    loggedOut: () => false,
+    isGuardValid: () => false,
+  });
+
+  const result = await safeSend("chat@s.whatsapp.net", "Codex: stale", {
+    guard: { chatKey: "chat@s.whatsapp.net", generation: 7 },
+  });
+  assert.equal(result.delivered, false);
+  assert.equal(attempts, 0);
+});
+
+test("delivered sends report the WhatsApp ids assigned to each chunk", async () => {
+  const sentIds: string[] = [];
+  initOutbound({
+    getSock: () =>
+      ({
+        sendMessage: async (_jid: string, _content: unknown, opts: any) => {
+          sentIds.push(opts.messageId);
+          return {};
+        },
+      }) as any,
+    isConnected: () => true,
+    rememberSent: () => {},
+    loggedOut: () => false,
+    isGuardValid: () => true,
+  });
+
+  const result = await safeSend("chat@s.whatsapp.net", `Codex: ${"a".repeat(8_500)}`);
+  assert.equal(result.delivered, true);
+  assert.ok(result.ids.length >= 2); // chunked send — one id per chunk
+  assert.deepEqual(result.ids, sentIds); // ids surfaced to the caller match the wire
+});
+
+test("a fully queued offline reply reports delivered with no sent ids (R4)", async () => {
+  // loggedOut short-circuits the retry window, so every chunk lands in the
+  // pending-sends queue: delivered (durably queued) but nothing went out live.
+  initOutbound({
+    getSock: () => undefined,
+    isConnected: () => false,
+    rememberSent: () => {},
+    loggedOut: () => true,
+    isGuardValid: () => true,
+  });
+
+  const result = await safeSend("offline@s.whatsapp.net", "Codex: queued reply");
+  assert.equal(result.delivered, true);
+  assert.equal(result.ids.length, 1); // id pre-assigned for the eventual flush
+  assert.deepEqual(result.sentIds, []); // nothing actually sent — R4 fallback case
 });
