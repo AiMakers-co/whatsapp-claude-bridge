@@ -12,6 +12,7 @@ import { rememberOutgoing, getForRetry, makeRetryCounterCache } from "./retransm
 import pino from "pino";
 import { config, monitoredGroupConfigs, type GroupConfig } from "./config.js";
 import { getProvider, providerNames } from "./providers.js";
+import { matchMention, stripMentionToken } from "./mentions.js";
 import {
   detectAttachment,
   saveIncoming,
@@ -554,10 +555,6 @@ async function persistOne(msg: WAMessage, remoteJid: string): Promise<void> {
  *     state (and full Claude Code power in `config.workdir`) as the
  *     dedicated group.
  */
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   if (!config.mentionEnabled) return;
   // Broadcast pseudo-chats (status@broadcast etc.) are not conversations:
@@ -582,15 +579,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   // trigger when it ends the token ("@computer." fires, "@computer.com" does
   // not). Longest trigger first so a shorter one can't shadow a longer overlap;
   // first match in that order wins.
-  let matched: { trigger: string; provider: string; idx: number } | undefined;
-  for (const t of [...config.mentionTriggers].sort((a, b) => b.trigger.length - a.trigger.length)) {
-    const re = new RegExp(`(^|\\s)${escapeRegex(t.trigger)}(?=\\s|$|[:,.!?](?:\\s|$))`, "i");
-    const m = re.exec(raw);
-    if (m) {
-      matched = { trigger: t.trigger, provider: t.provider, idx: m.index + m[1].length };
-      break;
-    }
-  }
+  const matched = matchMention(raw, config.mentionTriggers);
   if (!matched) return;
 
   const chat = getChat(remoteJid, config.workdir);
@@ -1067,9 +1056,22 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   const attachment = detectAttachment(msg);
   if (!raw && !attachment) return;
 
+  // Provider mentions also work inside dedicated command groups. They select
+  // a provider for this task only; `/use` remains the group's plain-message
+  // default. As everywhere else, only the user's own messages may trigger
+  // this routing override.
+  const matched =
+    config.mentionEnabled && msg.key.fromMe
+      ? matchMention(raw, config.mentionTriggers)
+      : undefined;
+
   // ── Optional command prefix gate (text only; files are explicit) ───
-  let body = raw;
-  if (config.commandPrefix && !attachment) {
+  // In a command group the mention is a provider selector, not an instruction
+  // boundary: preserve words on BOTH sides ("deploy this using @codex" must
+  // not become an empty task). Remove only the trigger token and its adjacent
+  // separator punctuation.
+  let body = matched ? stripMentionToken(raw, matched) : raw;
+  if (config.commandPrefix && !attachment && !matched) {
     const p = config.commandPrefix.toLowerCase();
     if (!body.toLowerCase().startsWith(p)) return;
     body = body.slice(config.commandPrefix.length).replace(/^[:\s]+/, "");
@@ -1081,7 +1083,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   const chat = getChat(remoteJid, groupCfg.workdir);
 
   // ── Control commands (never when a file is attached) ───────────────
-  if (!attachment && body.startsWith("/")) {
+  if (!attachment && !matched && body.startsWith("/")) {
     const [cmd, ...rest] = body.slice(1).split(/\s+/);
     const arg = rest.join(" ").trim();
     if (cmd === "new") {
@@ -1147,9 +1149,10 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     await reply("⏳ Still working on the previous task — send it again once I reply.");
     return;
   }
-  const provider = getProvider(chat.provider);
+  const providerName = matched?.provider ?? chat.provider;
+  const provider = getProvider(providerName);
   if (!provider) {
-    await reply(`⚠️ Unknown provider "${chat.provider}". Use /use <name> to pick one.`);
+    await reply(`⚠️ Unknown provider "${providerName}". Use /use <name> to pick one.`);
     return;
   }
   if (!ensureCwdValid(chat, groupCfg.workdir)) {
@@ -1167,7 +1170,8 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   chat.busy = true;
   const gen = chat.generation;
   const taskCwd = chat.cwd;
-  // Resume the session for this chat's provider (per-provider sessions).
+  // Resume the session for this task's selected provider (per-provider
+  // sessions keep @codex and @computer independent in the same group).
   const sessionAtDispatch = chat.sessions[provider.name];
   const inboxDir = join(taskCwd, "inbox");
   const outboxRoot = join(taskCwd, "outbox");
@@ -1213,7 +1217,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
 
   const startedAt = Date.now();
   log.info(
-    `[${remoteJid}] (${provider.name}) task in ${taskCwd}${filePath ? " +file" : ""}: ` +
+    `[${remoteJid}] (${matched ? `${matched.trigger}, ` : ""}${provider.name}) task in ${taskCwd}${filePath ? " +file" : ""}: ` +
       `${(body || attachment?.filename || "").replace(/\s+/g, " ").slice(0, 200)}`,
   );
   const rec = taskStarted({

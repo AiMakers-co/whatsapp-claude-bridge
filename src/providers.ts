@@ -97,6 +97,8 @@ function extractResultEvent(out: string): { text: string; sessionId?: string; is
 
 interface BuiltCall {
   args: string[];
+  /** Optional prompt bytes to write to stdin and close immediately. */
+  stdin?: string;
   parse: (o: { stdout: string; stderr: string; code: number | null }) => RunResult;
   /** Optional cleanup (e.g. temp files) run after parsing. */
   cleanup?: () => void;
@@ -193,11 +195,16 @@ const codex: ProviderSpec = {
       outFile,
     ];
     if (model) flags.push("-m", model);
+    // Codex documents `-` as "read the prompt from stdin". This avoids argv
+    // length limits and keeps live WhatsApp transcripts out of process lists;
+    // runOnce writes the bytes and closes stdin immediately (the missing EOF
+    // was the cause of the 2026-07-10 30-minute @codex hang).
     const args = resumeSessionId
-      ? ["exec", "resume", resumeSessionId, ...flags, task]
-      : ["exec", ...flags, task];
+      ? ["exec", "resume", ...flags, resumeSessionId, "-"]
+      : ["exec", ...flags, "-"];
     return {
       args,
+      stdin: task,
       parse: (o) => {
         let fileText = "";
         try {
@@ -350,9 +357,21 @@ function runOnce(
       env: process.env,
       detached: !isWin,
       windowsHide: true,
+      // Providers with explicit stdin receive a pipe that we close below;
+      // argv-only providers get /dev/null / NUL rather than an open pipe.
+      stdio: [call.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
+    if (call.stdin !== undefined && child.stdin) {
+      // A CLI can reject flags/auth and exit before consuming a large prompt.
+      // Swallow the resulting pipe error into the normal provider diagnostic;
+      // an unhandled EPIPE on this stream would otherwise crash the daemon.
+      child.stdin.on("error", (err) => {
+        stderr += `stdin: ${err.message}\n`;
+      });
+      child.stdin.end(call.stdin);
+    }
     let settled = false;
     const finish = (r: RunResult) => {
       if (settled) return;
@@ -362,6 +381,16 @@ function runOnce(
       resolve(r);
     };
     const timer = setTimeout(() => {
+      // Codex emits `thread.started` near the beginning of its JSONL stream.
+      // Preserve that id before killing a genuinely long run so the next
+      // WhatsApp request can resume the same thread. The final timeout text
+      // still wins; only the opaque resume id is recovered from partial output.
+      let sessionId: string | undefined;
+      try {
+        sessionId = call.parse({ stdout, stderr, code: null }).sessionId;
+      } catch {
+        /* partial provider output may not be parseable yet */
+      }
       try {
         if (isWin && child.pid) {
           // taskkill /T /F kills the whole child process tree.
@@ -382,10 +411,11 @@ function runOnce(
         text: `Task timed out after ${timeoutMs / 1000}s and was killed.`,
         isError: true,
         timedOut: true,
+        ...(sessionId ? { sessionId } : {}),
       });
     }, timeoutMs);
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdout?.on("data", (d) => (stdout += d.toString()));
+    child.stderr?.on("data", (d) => (stderr += d.toString()));
     child.on("error", (err) =>
       finish({
         text: `Failed to launch \`${spec.bin}\`: ${err.message}. Is it installed and on PATH?`,

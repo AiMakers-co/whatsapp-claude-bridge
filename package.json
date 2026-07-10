@@ -15,6 +15,7 @@
   },
   "scripts": {
     "setup": "bash scripts/setup.sh",
+    "test": "tsx --test tests/*.test.ts",
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",

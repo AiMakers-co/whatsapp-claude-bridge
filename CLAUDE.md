@@ -27,12 +27,11 @@ or `/use <name>` per chat.
 There are two independent trigger paths, both in `index.ts`:
 1. **Dedicated group(s)** — every message is an unprompted task. Hard-locked:
    fromMe or allowlisted only, never any other chat.
-2. **`@computer` mention trigger** (`handleMention`) — opt-in, works in ANY
-   chat, but only fires on messages YOU send (fromMe). It buffers a rolling
-   per-chat history (any sender) so there's context to read, and on trigger
-   runs a task with that transcript + full Claude Code power, replying into
-   the same chat. See "Hard rules" below — this is a deliberate carve-out,
-   not something to quietly revert if you see it.
+2. **Per-provider mention triggers** — opt-in, work in ANY chat, but only fire
+   on messages YOU send (fromMe). `MENTION_TRIGGERS` can route e.g.
+   `@computer:claude,@codex:codex`; sessions are independent per provider per
+   chat. Ordinary chats use `handleMention`; monitored groups apply the same
+   provider override to their normal task path. See "Hard rules" below.
 
 ## Setup procedure — do this in order
 
@@ -102,9 +101,9 @@ first.
   arbitrary chat, and never let anyone but the user (fromMe) invoke the
   `@computer` mention trigger — that would collide with other AI tools on the
   user's number or leak into chats with other people watching.
-- The `@computer` mention trigger (`ENABLE_MENTION_TRIGGER`, `MENTION_TRIGGER`
-  in `.env`) is an intentional, narrow exception the user explicitly asked
-  for: it reads history and replies in ANY chat, but strictly fromMe-gated.
+- The mention triggers (`ENABLE_MENTION_TRIGGER`, `MENTION_TRIGGER`, and
+  `MENTION_TRIGGERS` in `.env`) are an intentional, narrow exception the user
+  explicitly asked for: they reply in ANY chat, but are strictly fromMe-gated.
   This is not a bug and not scope creep to be reverted — if asked to touch
   this area again, preserve the fromMe-only invariant above all else.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that

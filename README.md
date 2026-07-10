@@ -21,39 +21,40 @@ runs entirely on your own machine.
 ## How it works
 
 ```
- WhatsApp (your phone)  ──▶  Baileys socket  ──▶  claude -p "<your message>"
-        ▲                                                │   --output-format json
-        │                                                │   --dangerously-skip-permissions
-        └──────────────  reply text  ◀───────────────────┘   (run in WORKDIR)
+ WhatsApp (your phone)  ──▶  Baileys socket  ──▶  Claude / Codex agent CLI
+        ▲                                                │
+        │                                                │  (run in WORKDIR)
+        └──────────────  reply text  ◀───────────────────┘
 ```
 
-- **Hard-locked to one group.** On connect the bridge creates (or finds) a single
-  dedicated group and acts **only** there, **only** on messages you send. It never
-  touches note-to-self, your own number, DMs, or any other chat — so it can't
-  collide with other tools on your WhatsApp. There is no allowlist override.
+- **Unprompted tasks are hard-locked.** The bridge only treats every message as
+  a task inside its configured command group(s), and only for you or explicitly
+  allowlisted senders. Other chats require one of your fromMe-only agent triggers.
 - **Conversational.** The group keeps a session; follow-up messages continue the
   same conversation (`--resume`). Send `/new` to start fresh.
 - **One task at a time**, with a hard timeout you control.
-- **`@computer` works anywhere.** Type it in any chat — a DM, a group,
-  whatever — and (as long as it's your own message) the bridge reads that
-  chat's recent messages and replies right there. See "Anywhere trigger"
-  below.
+- **Agent triggers work anywhere.** For example, route `@computer` to Claude
+  and `@codex` to Codex. Type either in a DM, ordinary group, or dedicated
+  command group; only your own messages can trigger an agent.
 
-## Anywhere trigger: `@computer`
+## Anywhere triggers: `@computer` and `@codex`
 
 The dedicated group treats every message as a task. Everywhere else, nothing
-happens unless **you** (never anyone else in the chat) write the trigger word
-— default `@computer`, configurable via `MENTION_TRIGGER` in `.env`. When you
-do, the bridge:
+happens unless **you** (never anyone else in the chat) write a configured
+trigger. `MENTION_TRIGGERS=@computer:claude,@codex:codex` routes each trigger
+to its own agent and keeps an independent resumable session for each provider
+inside that chat. When you use one, the bridge:
 
 1. Looks at the last ~30 messages it's seen in that chat (from anyone).
-2. Runs them — plus whatever you wrote right after the mention — through
-   Claude Code, with the same full power (file access, commands) as the
+2. Runs them — plus whatever you wrote right after the mention — through the
+   selected agent CLI, with the same full power (file access, commands) as the
    dedicated group, in `WORKDIR`.
 3. Replies directly into that chat.
 
-It's fromMe-gated by design: someone else in a group chat typing `@computer`
-does nothing. Set `ENABLE_MENTION_TRIGGER=false` to turn it off entirely.
+It's fromMe-gated by design: someone else typing `@computer` or `@codex` does
+nothing. In a dedicated command group, an explicit trigger overrides the
+group's default provider for that task only. Set `ENABLE_MENTION_TRIGGER=false`
+to turn all mention triggers off.
 
 ## Quick start
 
@@ -70,9 +71,9 @@ running 24/7:
 npm run install-service     # macOS launchd; auto-starts on login
 ```
 
-Requires **Node ≥ 20** and the **`claude` CLI** installed and logged in (the bridge
-shells out to it; `npm run setup` checks and warns if it's missing). Scanning the QR
-is the one step only a human can do — it links your WhatsApp account, by design.
+Requires **Node ≥ 20** and whichever agent CLI you select installed and logged in
+(`claude`, `codex`, `gemini`, or `grok`). Scanning the QR is the one step only a
+human can do — it links your WhatsApp account, by design.
 
 ## Configuration (`.env`)
 
@@ -81,11 +82,13 @@ is the one step only a human can do — it links your WhatsApp account, by desig
 | `WORKDIR` | Absolute path of the project Claude Code operates on. |
 | `GROUP_NAME` | Name of the dedicated group that is the bridge's **only** command channel. Default `Claude Chat`. |
 | `PROVIDER` | Agent CLI: `claude` (default) / `codex` / `gemini` / `grok`. |
-| `MODEL` | Optional model override for the provider. Empty = its default. |
+| `MODEL` | Legacy model override for the default provider only. |
+| `CLAUDE_MODEL`, `CODEX_MODEL`, `GEMINI_MODEL`, `GROK_MODEL` | Optional per-provider model overrides. Empty = that CLI's default. |
 | `COMMAND_PREFIX` | If set (e.g. `claude`), only group messages starting with it count as tasks. Empty = every message is a task. |
 | `TASK_TIMEOUT_SECONDS` | Kill a task after this long. Default `600`. |
 | `ENABLE_MENTION_TRIGGER` | Turn the anywhere-chat `@computer` trigger on/off. Default `true`. |
 | `MENTION_TRIGGER` | The trigger word/phrase. Default `@computer`. |
+| `MENTION_TRIGGERS` | Optional comma-separated `trigger:provider` routes, e.g. `@computer:claude,@codex:codex`. |
 
 ## Provider-agnostic
 
