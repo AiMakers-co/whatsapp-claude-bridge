@@ -20,6 +20,7 @@ import { log } from "./logger.js";
 
 const dataDir = resolve(config.authDir, "..", "data");
 const messagesDir = join(dataDir, "messages");
+const mediaStoreDir = join(dataDir, "media");
 const contactsFile = join(dataDir, "contacts.json");
 const chatsFile = join(dataDir, "chats.json");
 const sentIdsFile = join(dataDir, "sent-ids.json");
@@ -123,6 +124,7 @@ export interface StoredMessage {
   senderName: string;
   text: string;
   mediaType?: string; // image | video | audio | document (when an attachment)
+  mediaPath?: string; // absolute path to the stored media file (Feature 3)
 }
 
 interface Contact {
@@ -158,7 +160,14 @@ function scheduleContactsSave(): void {
 
 /** Serializable slice of per-chat state (never `busy` — that's runtime-only). */
 export interface PersistedChat {
+  /**
+   * Legacy single resume id (pre per-provider sessions). Still READ on load so
+   * old chats.json files migrate cleanly — it's attributed to `provider` — but
+   * no longer WRITTEN; new state persists `sessions` instead.
+   */
   sessionId?: string;
+  /** Resume ids keyed by provider name, so each agent keeps its own session. */
+  sessions?: Record<string, string>;
   cwd: string;
   provider: string;
 }
@@ -239,6 +248,15 @@ export function getContactName(jid: string): string | undefined {
 
 function sanitizeJid(jid: string): string {
   return jid.replace(/[^A-Za-z0-9@._-]/g, "_").slice(0, 120) || "unknown";
+}
+
+/**
+ * Absolute per-chat directory under data/media/ where incoming media is kept
+ * (Feature 3). The caller creates it lazily; the sanitized-jid layout matches
+ * data/messages/ so a chat's files and JSONL sit under parallel names.
+ */
+export function mediaDirForJid(jid: string): string {
+  return join(mediaStoreDir, sanitizeJid(jid));
 }
 
 /** Update the contacts index. `name` only overwrites when provided. */

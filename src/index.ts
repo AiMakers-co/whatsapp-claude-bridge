@@ -15,6 +15,7 @@ import { getProvider, providerNames } from "./providers.js";
 import {
   detectAttachment,
   saveIncoming,
+  storeIncomingMedia,
   flushOutbox,
   isolateOrphans,
   orphanTaskOutbox,
@@ -30,6 +31,7 @@ import { startApi } from "./api.js";
 import {
   flushAllNow,
   getContactName,
+  mediaDirForJid,
   recordMessage,
   loadChats,
   loadGroups,
@@ -45,9 +47,14 @@ import {
 import { initOutbound, safeSend, flushPending } from "./outbound.js";
 import { runtime, taskStarted, taskFinished } from "./runtime.js";
 
-/** Per-chat conversation state: provider, session to resume, working dir. */
+/** Per-chat conversation state: provider, per-provider sessions, working dir. */
 interface ChatState {
-  sessionId?: string;
+  /**
+   * Resume ids keyed by provider name. Each provider (claude/codex/…) tracks
+   * its own session, so a per-trigger provider switch (Feature 1) or /use never
+   * hands one CLI another CLI's opaque session id.
+   */
+  sessions: Record<string, string>;
   cwd: string;
   busy: boolean;
   provider: string;
@@ -90,7 +97,14 @@ function cwdTaskFinished(cwd: string): void {
   let fixed = false;
   for (const [jid, s] of Object.entries(loadChats())) {
     let cwd = s.cwd;
-    let sessionId = s.sessionId;
+    // Per-provider sessions: prefer the new `sessions` map; migrate a legacy
+    // single `sessionId` by attributing it to the chat's provider.
+    let sessions: Record<string, string> =
+      s.sessions && typeof s.sessions === "object"
+        ? { ...s.sessions }
+        : s.sessionId
+          ? { [s.provider]: s.sessionId }
+          : {};
     let pendingWarn: string | undefined;
     let ok = false;
     try {
@@ -102,10 +116,10 @@ function cwdTaskFinished(cwd: string): void {
       log.warn(`[${jid}] restored working dir no longer exists (${cwd}) — falling back to ${config.workdir}`);
       pendingWarn = `⚠️ Your previous working dir no longer exists:\n${cwd}\nFell back to:\n${config.workdir}\n(session reset)`;
       cwd = config.workdir;
-      sessionId = undefined;
+      sessions = {}; // cwd changed — every provider's session is invalid
       fixed = true;
     }
-    chats.set(jid, { sessionId, cwd, provider: s.provider, busy: false, generation: 0, pendingWarn });
+    chats.set(jid, { sessions, cwd, provider: s.provider, busy: false, generation: 0, pendingWarn });
   }
   if (fixed) persistChats();
 }
@@ -114,7 +128,11 @@ function cwdTaskFinished(cwd: string): void {
 function persistChats(): void {
   const obj: Record<string, PersistedChat> = {};
   for (const [jid, c] of chats) {
-    obj[jid] = { ...(c.sessionId ? { sessionId: c.sessionId } : {}), cwd: c.cwd, provider: c.provider };
+    obj[jid] = {
+      ...(Object.keys(c.sessions).length ? { sessions: c.sessions } : {}),
+      cwd: c.cwd,
+      provider: c.provider,
+    };
   }
   saveChats(obj);
 }
@@ -391,7 +409,7 @@ async function ensureGroupsInner(): Promise<void> {
 function getChat(jid: string, defaultCwd: string): ChatState {
   let c = chats.get(jid);
   if (!c) {
-    c = { cwd: defaultCwd, busy: false, provider: config.provider, generation: 0 };
+    c = { cwd: defaultCwd, busy: false, provider: config.provider, generation: 0, sessions: {} };
     chats.set(jid, c);
     persistChats();
   }
@@ -425,7 +443,7 @@ function ensureCwdValid(chat: ChatState, fallback: string): boolean {
   }
   const old = chat.cwd;
   chat.cwd = fallback;
-  chat.sessionId = undefined;
+  chat.sessions = {}; // cwd changed — every provider's session is invalid
   persistChats();
   chat.pendingWarn = `⚠️ Working dir no longer exists:\n${old}\nFell back to:\n${fallback}\n(session reset)`;
   log.warn(`[cwd] ${old} no longer exists — fell back to ${fallback}`);
@@ -451,33 +469,76 @@ function extractText(msg: WAMessage): string | undefined {
 /**
  * Persist an incoming (or phone-typed fromMe) message into the JSONL store.
  * Purely additive observation — must never throw into message handling.
+ *
+ * Fire-and-forget, but serialized PER CHAT: storing incoming media (Feature 3)
+ * awaits a download, and two media messages in the same chat could otherwise
+ * record out of arrival order (whichever download finishes first). The per-jid
+ * promise chain (mirroring store.ts's recordMessage append chain) keeps this
+ * chat's lines in order while never blocking OTHER chats or the upsert handler
+ * — handleIncoming already dispatches each message detached.
  */
+const persistChains = new Map<string, Promise<void>>();
 function persistMessage(msg: WAMessage, remoteJid: string): void {
-  try {
-    if (remoteJid.endsWith("@broadcast")) return; // status updates etc.
-    const text = extractText(msg)?.trim();
-    const att = detectAttachment(msg);
-    if (!text && !att) return; // protocol/system message — skip
-    const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
-    const senderJid = jidNormalizedUser(msg.key.participant ?? remoteJid);
-    const senderName = msg.key.fromMe
-      ? "You"
-      : msg.pushName?.trim() || senderJid.split("@")[0];
-    recordMessage(remoteJid, {
-      ts,
-      fromMe: !!msg.key.fromMe,
-      sender: senderJid,
-      senderName,
-      text: text || `[${att!.kind}: ${att!.filename}]`,
-      ...(att ? { mediaType: att.kind } : {}),
-    });
-    // Contacts index: DM names come from the other side's pushName only.
-    const isDm = !remoteJid.endsWith("@g.us");
-    const name = isDm && !msg.key.fromMe ? msg.pushName?.trim() : undefined;
-    touchContact(remoteJid, name, ts);
-  } catch (e: any) {
-    log.warn(`persistMessage failed: ${e?.message ?? e}`);
+  const prev = persistChains.get(remoteJid) ?? Promise.resolve();
+  const next = prev
+    .then(() => persistOne(msg, remoteJid))
+    .catch((e) => log.warn(`persistMessage failed: ${e?.message ?? e}`));
+  persistChains.set(remoteJid, next);
+  void next.finally(() => {
+    if (persistChains.get(remoteJid) === next) persistChains.delete(remoteJid);
+  });
+}
+
+async function persistOne(msg: WAMessage, remoteJid: string): Promise<void> {
+  if (remoteJid.endsWith("@broadcast")) return; // status updates etc.
+  const text = extractText(msg)?.trim();
+  const att = detectAttachment(msg);
+  if (!text && !att) return; // protocol/system message — skip
+  const ts = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000);
+  const senderJid = jidNormalizedUser(msg.key.participant ?? remoteJid);
+  const senderName = msg.key.fromMe
+    ? "You"
+    : msg.pushName?.trim() || senderJid.split("@")[0];
+
+  // Passively store incoming media (any chat, any direction) so it's kept, not
+  // reduced to a name-only placeholder. A failed/oversized/disabled download
+  // never breaks message handling — it just falls back to the old placeholder.
+  let mediaPath: string | undefined;
+  if (att && config.mediaStore) {
+    const liveSock = currentSock;
+    if (liveSock) {
+      try {
+        mediaPath = await storeIncomingMedia(
+          liveSock,
+          msg,
+          mediaDirForJid(remoteJid),
+          `${ts}-${att.filename}`,
+          config.mediaMaxBytes,
+        );
+      } catch (e: any) {
+        log.warn(`media store failed for ${remoteJid}: ${e?.message ?? e}`);
+      }
+    }
   }
+
+  const placeholder = att
+    ? mediaPath
+      ? `[${att.kind}: ${att.filename} → ${mediaPath}]`
+      : `[${att.kind}: ${att.filename}]`
+    : "";
+  recordMessage(remoteJid, {
+    ts,
+    fromMe: !!msg.key.fromMe,
+    sender: senderJid,
+    senderName,
+    text: text || placeholder,
+    ...(att ? { mediaType: att.kind } : {}),
+    ...(mediaPath ? { mediaPath } : {}),
+  });
+  // Contacts index: DM names come from the other side's pushName only.
+  const isDm = !remoteJid.endsWith("@g.us");
+  const name = isDm && !msg.key.fromMe ? msg.pushName?.trim() : undefined;
+  touchContact(remoteJid, name, ts);
 }
 
 /**
@@ -515,24 +576,30 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   if (entryText) bufferHistory(remoteJid, { label, text: entryText, ts });
 
   if (!msg.key.fromMe) return; // only you can invoke it, per design
-  // Word-boundary match only: "@computer" must not fire on a substring like
-  // "support@computerstore.com" typed into a real conversation. Punctuation
-  // only terminates the trigger when it ends the token — "@computer." fires,
-  // "@computer.com" does not.
-  const triggerRe = new RegExp(
-    `(^|\\s)${escapeRegex(config.mentionTrigger)}(?=\\s|$|[:,.!?](?:\\s|$))`,
-    "i",
-  );
-  const match = triggerRe.exec(raw);
-  if (!match) return;
-  const idx = match.index + match[1].length;
+  // Per-trigger provider routing (Feature 1): each configured trigger selects
+  // its own provider. Word-boundary match only — "@computer" must not fire on a
+  // substring like "support@computerstore.com". Punctuation only terminates the
+  // trigger when it ends the token ("@computer." fires, "@computer.com" does
+  // not). Longest trigger first so a shorter one can't shadow a longer overlap;
+  // first match in that order wins.
+  let matched: { trigger: string; provider: string; idx: number } | undefined;
+  for (const t of [...config.mentionTriggers].sort((a, b) => b.trigger.length - a.trigger.length)) {
+    const re = new RegExp(`(^|\\s)${escapeRegex(t.trigger)}(?=\\s|$|[:,.!?](?:\\s|$))`, "i");
+    const m = re.exec(raw);
+    if (m) {
+      matched = { trigger: t.trigger, provider: t.provider, idx: m.index + m[1].length };
+      break;
+    }
+  }
+  if (!matched) return;
 
   const chat = getChat(remoteJid, config.workdir);
   if (chat.busy) {
-    await safeSend(remoteJid, `⏳ Still working on the previous ${config.mentionTrigger} request here — hang on.`);
+    await safeSend(remoteJid, `⏳ Still working on the previous ${matched.trigger} request here — hang on.`);
     return;
   }
-  const provider = getProvider(chat.provider);
+  // The trigger — not the chat's default provider — selects the agent here.
+  const provider = getProvider(matched.provider);
   if (!provider) return;
   if (!ensureCwdValid(chat, config.workdir)) {
     await safeSend(
@@ -543,7 +610,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   }
 
   const instruction = raw
-    .slice(idx + config.mentionTrigger.length)
+    .slice(matched.idx + matched.trigger.length)
     .replace(/^[:,\s]+/, "")
     .trim();
   const transcript = formatHistory(remoteJid);
@@ -554,7 +621,8 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   chat.busy = true;
   const gen = chat.generation;
   const taskCwd = chat.cwd;
-  const sessionAtDispatch = chat.sessionId;
+  // Resume the session for THIS trigger's provider (per-provider sessions).
+  const sessionAtDispatch = chat.sessions[provider.name];
   const outboxRoot = join(taskCwd, "outbox");
   // Per-task private outbox: concurrent tasks sharing a workdir must never
   // sweep each other's in-flight files.
@@ -563,7 +631,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   chat.pendingWarn = undefined;
 
   const task =
-    `You were just mentioned ("${config.mentionTrigger}") in a live WhatsApp conversation. ` +
+    `You were just mentioned ("${matched.trigger}") in a live WhatsApp conversation. ` +
     `This is an ordinary chat, not the dedicated command group — reply like a helpful ` +
     `participant joining the conversation, not a task-runner. Keep it concise and natural; ` +
     `it is posted directly into this chat for everyone there to read.\n\n` +
@@ -577,7 +645,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
   // getter — long tasks outlive reconnects, so a captured sock goes stale.
   await currentSock?.sendPresenceUpdate("composing", remoteJid).catch(() => {});
   if (warn) await safeSend(remoteJid, warn);
-  log.info(`[${remoteJid}] (${config.mentionTrigger}, ${provider.name}) triggered`);
+  log.info(`[${remoteJid}] (${matched.trigger}, ${provider.name}) triggered`);
   // Quarantine legacy loose files in the shared outbox root (per-task subdirs
   // are never touched). Skipped while another chat has a task running in this
   // same workdir: guard kept for the legacy loose-file case.
@@ -594,13 +662,14 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
     mkdirSync(taskOutbox, { recursive: true });
     const res = await provider.run(
       task,
-      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.model || undefined },
+      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.modelFor(provider.name) },
       config.taskTimeoutMs,
     );
-    // Session writeback only if no control command changed state meanwhile.
+    // Session writeback (keyed by provider) only if no control command changed
+    // state meanwhile.
     if (chat.generation === gen) {
-      if (res.resetSession) chat.sessionId = undefined; // stale --resume id recovered
-      if (res.sessionId) chat.sessionId = res.sessionId;
+      if (res.resetSession) delete chat.sessions[provider.name]; // stale --resume id recovered
+      if (res.sessionId) chat.sessions[provider.name] = res.sessionId;
       persistChats();
     }
     taskFinished(rec, {
@@ -651,7 +720,7 @@ async function handleMention(msg: WAMessage, remoteJid: string): Promise<void> {
       }
     }
   } catch (e: any) {
-    log.error(`[${remoteJid}] ${config.mentionTrigger} error: ${e?.message ?? e}`);
+    log.error(`[${remoteJid}] ${matched.trigger} error: ${e?.message ?? e}`);
     taskFinished(rec, { status: "error" });
     orphanTaskOutbox(taskOutbox, outboxRoot);
     await safeSend(remoteJid, `💥 Bridge error: ${e?.message ?? e}`);
@@ -838,7 +907,8 @@ async function startInner() {
       if (config.commandPrefix) log.info(`Command prefix: "${config.commandPrefix}"`);
       log.info(
         config.mentionEnabled
-          ? `Mention trigger: "${config.mentionTrigger}" works in ANY chat (fromMe only).`
+          ? `Mention triggers (any chat, fromMe only): ` +
+              config.mentionTriggers.map((t) => `"${t.trigger}"→${t.provider}`).join(", ")
           : `Mention trigger: disabled.`,
       );
       log.info("Ready. Control commands: /new  /cd <path>  /use <provider>  /status");
@@ -1015,7 +1085,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     const [cmd, ...rest] = body.slice(1).split(/\s+/);
     const arg = rest.join(" ").trim();
     if (cmd === "new") {
-      chat.sessionId = undefined;
+      chat.sessions = {}; // clear every provider's session for this chat
       chat.generation++; // a running task's completion must not restore the old session
       persistChats();
       await reply("🆕 Started a fresh session.");
@@ -1032,7 +1102,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
           await reply(`⚠️ Not a directory (or doesn't exist):\n${arg}\nWorking dir unchanged.`);
         } else {
           chat.cwd = arg;
-          chat.sessionId = undefined;
+          chat.sessions = {}; // cwd changed — every provider's session is invalid
           chat.generation++;
           persistChats();
           await reply(`📁 Working dir set to:\n${arg}\n(session reset)`);
@@ -1053,7 +1123,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
         await reply(`Pick a provider: /use <name>\n\n${list}`);
       } else {
         chat.provider = name;
-        chat.sessionId = undefined;
+        delete chat.sessions[name]; // fresh session for the provider being switched to
         chat.generation++;
         persistChats();
         await reply(
@@ -1064,7 +1134,7 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     } else if (cmd === "status") {
       await reply(
         `📊 Status\nProvider: ${chat.provider}\nDir: ${chat.cwd}\n` +
-          `Session: ${chat.sessionId ?? "none (fresh)"}\nBusy: ${chat.busy}`,
+          `Session: ${chat.sessions[chat.provider] ?? "none (fresh)"}\nBusy: ${chat.busy}`,
       );
     } else {
       await reply("Unknown command. Available: /new  /cd <path>  /use <provider>  /status");
@@ -1097,7 +1167,8 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
   chat.busy = true;
   const gen = chat.generation;
   const taskCwd = chat.cwd;
-  const sessionAtDispatch = chat.sessionId;
+  // Resume the session for this chat's provider (per-provider sessions).
+  const sessionAtDispatch = chat.sessions[provider.name];
   const inboxDir = join(taskCwd, "inbox");
   const outboxRoot = join(taskCwd, "outbox");
   // Per-task private outbox: concurrent tasks sharing a workdir must never
@@ -1157,15 +1228,16 @@ async function handleIncoming(msg: WAMessage): Promise<void> {
     mkdirSync(taskOutbox, { recursive: true });
     const res = await provider.run(
       task,
-      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.model || undefined },
+      { cwd: taskCwd, resumeSessionId: sessionAtDispatch, model: config.modelFor(provider.name) },
       config.taskTimeoutMs,
     );
-    // Session writeback only if no control command changed state meanwhile —
-    // otherwise a /new (or /use's provider switch) issued mid-task would be
-    // silently undone (or a claude session id stored under provider=codex).
+    // Session writeback (keyed by provider) only if no control command changed
+    // state meanwhile — otherwise a /new (or /use's provider switch) issued
+    // mid-task would be silently undone. Per-provider sessions also mean a
+    // claude id can no longer be stored under provider=codex.
     if (chat.generation === gen) {
-      if (res.resetSession) chat.sessionId = undefined; // stale --resume id recovered
-      if (res.sessionId) chat.sessionId = res.sessionId;
+      if (res.resetSession) delete chat.sessions[provider.name]; // stale --resume id recovered
+      if (res.sessionId) chat.sessions[provider.name] = res.sessionId;
       persistChats();
     }
     const secs = ((Date.now() - startedAt) / 1000).toFixed(1);

@@ -33,6 +33,52 @@ function parseJids(raw?: string): string[] {
     .filter(Boolean);
 }
 
+/** The agent CLIs the bridge knows how to drive (mirrors providers.ts SPECS). */
+const KNOWN_PROVIDERS = new Set(["claude", "codex", "gemini", "grok"]);
+
+/**
+ * Per-trigger provider routing. MENTION_TRIGGERS is a comma-separated list of
+ * `trigger:provider` pairs (e.g. `@computer:claude,@codex:codex`), so a
+ * different mention word can drive a different agent CLI in ANY chat. Invalid
+ * entries (bad shape, unknown provider) are warned about and skipped so one
+ * typo never disables the whole trigger. When unset, a single legacy entry is
+ * derived from MENTION_TRIGGER mapped to the default provider — unchanged
+ * behaviour. (console.warn, not the logger: logger.ts imports config.)
+ */
+function parseMentionTriggers(
+  raw: string | undefined,
+  fallbackTrigger: string,
+  defaultProvider: string,
+): Array<{ trigger: string; provider: string }> {
+  const out: Array<{ trigger: string; provider: string }> = [];
+  if (raw && raw.trim()) {
+    for (const pair of raw.split(",")) {
+      const p = pair.trim();
+      if (!p) continue;
+      // lastIndexOf so a trigger may itself contain a colon; the LAST colon
+      // separates trigger from provider.
+      const idx = p.lastIndexOf(":");
+      if (idx < 0) {
+        console.warn(`MENTION_TRIGGERS entry "${p}" has no ":provider" — skipped.`);
+        continue;
+      }
+      const trigger = p.slice(0, idx).trim();
+      const provider = p.slice(idx + 1).trim().toLowerCase();
+      if (!trigger) {
+        console.warn(`MENTION_TRIGGERS entry "${p}" has an empty trigger — skipped.`);
+        continue;
+      }
+      if (!KNOWN_PROVIDERS.has(provider)) {
+        console.warn(`MENTION_TRIGGERS: unknown provider "${provider}" for "${trigger}" — skipped.`);
+        continue;
+      }
+      out.push({ trigger, provider });
+    }
+  }
+  if (out.length === 0) out.push({ trigger: fallbackTrigger, provider: defaultProvider });
+  return out;
+}
+
 /**
  * Extra monitored groups beyond the primary one, as a JSON array in EXTRA_GROUPS.
  * Each entry: { name, workdir, allowedJids?, participants? }. Malformed entries are
@@ -69,6 +115,28 @@ if (apiPort !== rawApiPort) {
   console.warn(`WA_API_PORT out of range (${rawApiPort}) — falling back to 8477.`);
 }
 
+// Cap for the passive incoming-media store (Feature 3). Incoming WhatsApp media
+// is already <=16 MB, so a higher value simply imposes no extra limit; a lower
+// one skips storing anything bigger (the message keeps its plain placeholder).
+const rawMediaMaxMb = Number(process.env.MEDIA_MAX_MB);
+const mediaMaxMb = Number.isFinite(rawMediaMaxMb) && rawMediaMaxMb >= 1 ? rawMediaMaxMb : 16;
+if (process.env.MEDIA_MAX_MB && mediaMaxMb !== rawMediaMaxMb) {
+  console.warn(`MEDIA_MAX_MB invalid (${process.env.MEDIA_MAX_MB}) — using 16 MB.`);
+}
+
+// Default agent CLI + model routing. Each provider reads its OWN model env so
+// codex never gets handed claude's model string (the root-cause bug: one shared
+// MODEL was passed to every provider). Legacy MODEL applies to the default
+// provider only, preserving its old meaning.
+const defaultProvider = process.env.PROVIDER?.trim().toLowerCase() || "claude";
+const legacyModel = process.env.MODEL?.trim() || "";
+const perProviderModel: Record<string, string> = {
+  claude: process.env.CLAUDE_MODEL?.trim() || "",
+  codex: process.env.CODEX_MODEL?.trim() || "",
+  gemini: process.env.GEMINI_MODEL?.trim() || "",
+  grok: process.env.GROK_MODEL?.trim() || "",
+};
+
 export const config = {
   /** Directory Claude Code operates in. */
   workdir: process.env.WORKDIR?.trim() || repoRoot,
@@ -77,10 +145,21 @@ export const config = {
   commandPrefix: process.env.COMMAND_PREFIX?.trim() || "",
 
   /** Which agent CLI to drive: claude | codex | gemini | grok. */
-  provider: process.env.PROVIDER?.trim().toLowerCase() || "claude",
+  provider: defaultProvider,
 
-  /** Optional model override passed to the selected provider. */
-  model: process.env.MODEL?.trim() || process.env.CLAUDE_MODEL?.trim() || "",
+  /**
+   * Model to pass to a given provider (undefined = omit the flag, provider
+   * default). Backed by per-provider envs CLAUDE_MODEL / CODEX_MODEL /
+   * GEMINI_MODEL / GROK_MODEL; the legacy MODEL env applies to the default
+   * provider only. Replaces the old single `config.model`, which was passed to
+   * every provider and made e.g. codex run `-m claude-...` and error.
+   */
+  modelFor(provider: string): string | undefined {
+    const specific = perProviderModel[provider];
+    if (specific) return specific;
+    if (provider === defaultProvider && legacyModel) return legacyModel;
+    return undefined;
+  },
 
   /** Hard timeout per task in milliseconds (clamped to >= 30s above). */
   taskTimeoutMs,
@@ -112,6 +191,25 @@ export const config = {
    */
   mentionEnabled: (process.env.ENABLE_MENTION_TRIGGER ?? "true").toLowerCase() !== "false",
   mentionTrigger: process.env.MENTION_TRIGGER?.trim() || "@computer",
+
+  /**
+   * Per-trigger provider routing: each `{ trigger, provider }` fires that
+   * provider in ANY chat (fromMe only). Parsed from MENTION_TRIGGERS; when
+   * unset, a single legacy entry (mentionTrigger -> default provider) is used.
+   */
+  mentionTriggers: parseMentionTriggers(
+    process.env.MENTION_TRIGGERS,
+    process.env.MENTION_TRIGGER?.trim() || "@computer",
+    defaultProvider,
+  ),
+
+  /**
+   * Passively download + keep incoming media (any chat, any direction) instead
+   * of reducing it to a `[image: name.jpg]` placeholder. MEDIA_MAX_MB caps the
+   * stored size. See src/store.ts (media dir) and persistMessage in index.ts.
+   */
+  mediaStore: (process.env.MEDIA_STORE ?? "true").toLowerCase() !== "false",
+  mediaMaxBytes: Math.round(mediaMaxMb * 1024 * 1024),
 
   /**
    * Local control API (src/api.ts). Loopback-only HTTP server that lets

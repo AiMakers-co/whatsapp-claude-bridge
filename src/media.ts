@@ -78,19 +78,15 @@ export function detectAttachment(msg: WAMessage): Attachment | null {
   return null;
 }
 
-/** Download an attachment into `<dir>/inbox`, returning the saved absolute path. */
-export async function saveIncoming(
-  sock: WASocket,
-  msg: WAMessage,
-  att: Attachment,
-  inboxDir: string,
-): Promise<string> {
-  mkdirSync(inboxDir, { recursive: true });
-  // Stream the download so the size cap is enforced WHILE downloading — a
-  // lying/oversized payload gets aborted instead of buffered whole into RAM.
-  // One hard deadline covers the whole download: a mid-stream stall (flap
-  // during transfer) would otherwise pend forever and wedge the calling
-  // chat's busy flag until restart.
+/**
+ * Stream an attachment's bytes into memory, enforcing `maxBytes` WHILE
+ * downloading — a lying/oversized payload gets aborted instead of buffered
+ * whole into RAM. One hard deadline covers the whole download: a mid-stream
+ * stall (flap during transfer) would otherwise pend forever and wedge the
+ * caller until restart. Shared by inbox delivery (saveIncoming) and the passive
+ * media store (storeIncomingMedia) so the stream/cap/timeout logic lives once.
+ */
+async function downloadToBuffer(sock: WASocket, msg: WAMessage, maxBytes: number): Promise<Buffer> {
   const deadline = Date.now() + DOWNLOAD_TIMEOUT_MS;
   // Keep the download promise so the race LOSER can be cleaned up: if the
   // timeout wins, a stream that resolves late must be destroyed (otherwise the
@@ -126,28 +122,36 @@ export async function saveIncoming(
     for await (const c of stream) {
       const buf = c as Buffer;
       total += buf.length;
-      if (total > MAX_BYTES) {
+      if (total > maxBytes) {
         stream.destroy();
-        throw new Error(`file exceeds the ${(MAX_BYTES / 1048576).toFixed(0)} MB limit — download aborted`);
+        throw new Error(`file exceeds the ${(maxBytes / 1048576).toFixed(0)} MB limit — download aborted`);
       }
       chunks.push(buf);
     }
   } finally {
     clearTimeout(killer);
   }
-  const buffer = Buffer.concat(chunks);
-  // Avoid clobbering existing files with the same name.
-  let target = join(inboxDir, sanitize(att.filename));
+  return Buffer.concat(chunks);
+}
+
+/** A collision-free path in `dir` for `filename` (appends -1, -2, ... as needed). */
+function uniqueTarget(dir: string, filename: string): string {
+  let target = join(dir, sanitize(filename));
   let n = 1;
   while (safeExists(target)) {
-    const ext = extname(att.filename);
-    target = join(inboxDir, `${sanitize(basename(att.filename, ext))}-${n}${ext}`);
+    const ext = extname(filename);
+    target = join(dir, `${sanitize(basename(filename, ext))}-${n}${ext}`);
     n++;
   }
+  return target;
+}
+
+/** Write a downloaded buffer to `target`, cleaning up a partial file on error. */
+function writeOrCleanup(target: string, buffer: Buffer): void {
   try {
     writeFileSync(target, buffer);
   } catch (e) {
-    // Never leave a partial file behind for the task to read.
+    // Never leave a partial file behind for a task (or the store) to read.
     try {
       unlinkSync(target);
     } catch {
@@ -155,7 +159,43 @@ export async function saveIncoming(
     }
     throw e;
   }
+}
+
+/** Download an attachment into `<dir>/inbox`, returning the saved absolute path. */
+export async function saveIncoming(
+  sock: WASocket,
+  msg: WAMessage,
+  att: Attachment,
+  inboxDir: string,
+): Promise<string> {
+  mkdirSync(inboxDir, { recursive: true });
+  const buffer = await downloadToBuffer(sock, msg, MAX_BYTES);
+  const target = uniqueTarget(inboxDir, att.filename);
+  writeOrCleanup(target, buffer);
   log.info(`Saved incoming ${att.kind} (${buffer.length} bytes) -> ${target}`);
+  return target;
+}
+
+/**
+ * Passively persist an incoming attachment into the media store (Feature 3),
+ * returning the saved absolute path. Same stream/cap/timeout core as
+ * saveIncoming, but honours the configurable `maxBytes` (MEDIA_MAX_MB) and
+ * writes under `mediaDir` (data/media/<jid>) instead of a task's inbox. The
+ * caller keeps the message flowing on failure — this only ever adds a stored
+ * copy, it must not become a hard dependency of message handling.
+ */
+export async function storeIncomingMedia(
+  sock: WASocket,
+  msg: WAMessage,
+  mediaDir: string,
+  filename: string,
+  maxBytes: number,
+): Promise<string> {
+  mkdirSync(mediaDir, { recursive: true });
+  const buffer = await downloadToBuffer(sock, msg, maxBytes);
+  const target = uniqueTarget(mediaDir, filename);
+  writeOrCleanup(target, buffer);
+  log.info(`Stored incoming media (${buffer.length} bytes) -> ${target}`);
   return target;
 }
 

@@ -63,10 +63,18 @@ export const FIELDS: SettingField[] = [
   },
   {
     key: "CLAUDE_MODEL",
-    label: "Model override",
+    label: "Claude model",
     type: "text",
     group: "General",
-    help: "Passed to the provider. Blank = the provider's own default.",
+    help: "Model passed to the claude provider. Blank = the provider's own default.",
+    placeholder: "provider default",
+  },
+  {
+    key: "CODEX_MODEL",
+    label: "Codex model",
+    type: "text",
+    group: "General",
+    help: "Model passed to the codex provider. Blank = the provider's own default. (Each provider has its own model — one shared model would make codex run with a claude model name.)",
     placeholder: "provider default",
   },
   {
@@ -130,8 +138,32 @@ export const FIELDS: SettingField[] = [
     label: "Trigger word",
     type: "text",
     group: "Mention trigger",
-    help: "The word that fires a task in any chat (fromMe only).",
+    help: "The word that fires a task in any chat (fromMe only). Used only when the per-trigger routing below is blank.",
     placeholder: "@computer",
+  },
+  {
+    key: "MENTION_TRIGGERS",
+    label: "Per-trigger provider routing",
+    type: "text",
+    group: "Mention trigger",
+    help: 'Comma-separated trigger:provider pairs, e.g. @computer:claude,@codex:codex — each word fires that agent in any chat. Blank = the single trigger word above with the default provider.',
+    placeholder: "trigger word → default provider",
+  },
+  // ── Media ──
+  {
+    key: "MEDIA_STORE",
+    label: "Store incoming media",
+    type: "bool",
+    group: "Media",
+    help: "Download and keep incoming media (any chat, any direction) under data/media/ instead of just a name placeholder.",
+  },
+  {
+    key: "MEDIA_MAX_MB",
+    label: "Max stored media size (MB)",
+    type: "number",
+    group: "Media",
+    help: "Skip storing incoming media larger than this. Minimum 1.",
+    placeholder: "16",
   },
   // ── Advanced ──
   {
@@ -254,6 +286,31 @@ function validate(updates: Record<string, string>): Record<string, string> {
   const timeout = get("TASK_TIMEOUT_SECONDS");
   if (timeout && !(Number(timeout) > 0)) {
     errors.TASK_TIMEOUT_SECONDS = "Must be a positive number.";
+  }
+
+  const mediaMax = get("MEDIA_MAX_MB");
+  if (mediaMax && !(Number(mediaMax) >= 1)) {
+    errors.MEDIA_MAX_MB = "Must be a number of at least 1.";
+  }
+
+  const triggers = get("MENTION_TRIGGERS");
+  if (triggers) {
+    const valid = new Set(["claude", "codex", "gemini", "grok"]);
+    for (const pair of triggers.split(",")) {
+      const p = pair.trim();
+      if (!p) continue;
+      const idx = p.lastIndexOf(":");
+      const trigger = idx >= 0 ? p.slice(0, idx).trim() : "";
+      const provider = idx >= 0 ? p.slice(idx + 1).trim().toLowerCase() : "";
+      if (!trigger || !provider) {
+        errors.MENTION_TRIGGERS = `Each entry must be "trigger:provider" — bad entry: "${p}".`;
+        break;
+      }
+      if (!valid.has(provider)) {
+        errors.MENTION_TRIGGERS = `Unknown provider "${provider}" — use claude, codex, gemini or grok.`;
+        break;
+      }
+    }
   }
 
   const level = get("WA_LOG_LEVEL").toLowerCase();

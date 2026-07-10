@@ -207,7 +207,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
       uptimeSec: Math.floor((Date.now() - runtime.startedAt) / 1000),
       reconnects: runtime.reconnects,
       provider: config.provider,
-      model: config.model,
+      model: config.modelFor(config.provider) ?? "",
       workdir: config.workdir,
       pendingSends: runtime.pendingSendsCount(),
       // newest first; explicit field map keeps the wire shape stable
