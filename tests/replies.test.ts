@@ -8,9 +8,11 @@ import {
   hasAutomationMarker,
   hasBotReplyPrefix,
   markAutomated,
+  neutralizeTriggerTokens,
   prefixReply,
   stripAutomationMarker,
 } from "../src/replies.js";
+import { matchMention } from "../src/mentions.js";
 import {
   chunkForWhatsApp,
   delayedReplyText,
@@ -25,6 +27,27 @@ test("reply labels are deterministic and never doubled", () => {
   assert.equal(prefixReply("Codex", "hello"), "Codex: hello");
   assert.equal(prefixReply("Codex", "Codex: hello"), "Codex: hello");
   assert.equal(prefixReply("Codex", "*Codex:* hello"), "Codex: hello");
+});
+
+test("neutralizeTriggerTokens defuses a live call sign embedded in a job note", () => {
+  const triggers = ["@computer", "@codex"];
+  // A job note derived from user/agent text: "/job @codex please rebuild x".
+  const note = "@codex please rebuild x";
+  const safe = neutralizeTriggerTokens(note, triggers);
+  const routes = [
+    { trigger: "@computer", provider: "claude" },
+    { trigger: "@codex", provider: "codex" },
+  ];
+  // The RAW note would fire another local automation's matcher…
+  assert.ok(matchMention(note, routes));
+  // …the neutralized note must NOT — the token is split by the invisible marker.
+  assert.equal(matchMention(safe, routes), undefined);
+  // Still readable to a human (only an invisible char was inserted).
+  assert.equal(safe.replace(/⁣/g, ""), note);
+  // Trailing-punctuation form ("@codex;") is defused too, and unrelated "@"
+  // handles are left alone.
+  assert.equal(matchMention(neutralizeTriggerTokens("ping @codex;", triggers), routes), undefined);
+  assert.equal(neutralizeTriggerTokens("email @someone about it", triggers), "email @someone about it");
 });
 
 test("automation markers and visible bot prefixes are recognized", () => {

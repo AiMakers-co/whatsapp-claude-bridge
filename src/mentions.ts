@@ -130,7 +130,7 @@ export function matchMention(
   // Longest first so a shorter trigger cannot shadow an overlapping one.
   for (const route of [...routes].sort((a, b) => b.trigger.length - a.trigger.length)) {
     const start = options.leadingOnly ? "^(\\s*)" : "(^|\\s)";
-    const re = new RegExp(`${start}${escapeRegex(route.trigger)}(?=\\s|$|[:,.!?](?:\\s|$))`, "i");
+    const re = new RegExp(`${start}${escapeRegex(route.trigger)}(?=\\s|$|[:;,.!?](?:\\s|$))`, "i");
     const match = re.exec(raw);
     if (match) {
       return {

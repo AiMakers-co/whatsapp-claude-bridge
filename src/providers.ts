@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 /**
  * Provider-agnostic agent layer.
@@ -18,6 +18,20 @@ export interface RunOpts {
   cwd: string;
   resumeSessionId?: string;
   model?: string;
+  /** Receives a cancel handle right after spawn. cancel() kills the whole
+   *  process tree (same mechanism as the timeout) and resolves the run
+   *  with { isError:true, cancelled:true }, salvaging sessionId. */
+  onSpawn?: (handle: { cancel: (reason?: string) => void; pid?: number }) => void;
+  /** Receives synthesized progress summaries while the run streams. Only fires
+   *  when the provider has a progressFromEvent mapper; enabling it switches
+   *  claude to stream-json output (see build()). */
+  onProgress?: (ev: ProgressEvent) => void;
+}
+
+/** One synthesized progress line — text only, never raw JSON/base64. */
+export interface ProgressEvent {
+  kind: "tool" | "text";
+  summary: string;
 }
 
 export interface RunResult {
@@ -28,6 +42,8 @@ export interface RunResult {
   costUsd?: number;
   /** The run hit the hard timeout and the process tree was killed. */
   timedOut?: boolean;
+  /** Externally cancelled via the onSpawn handle — process tree was killed. */
+  cancelled?: boolean;
   /**
    * The stored resume id was stale (provider lost the session) and the task
    * was re-run fresh — the caller should drop its stored sessionId.
@@ -111,7 +127,11 @@ interface ProviderSpec {
   supportsResume: boolean;
   /** One-liner shown in /use help. */
   blurb: string;
-  build: (task: string, opts: { model?: string; resumeSessionId?: string }) => BuiltCall;
+  /** argv/output changes when the caller wants live progress (stream:true). */
+  build: (task: string, opts: { model?: string; resumeSessionId?: string; stream?: boolean }) => BuiltCall;
+  /** Map one parsed NDJSON event to a progress summary; undefined = ignore.
+   *  MUST synthesize text only — never return raw JSON/base64. */
+  progressFromEvent?: (ev: unknown) => ProgressEvent | undefined;
 }
 
 // ── Provider presets ────────────────────────────────────────────────────────
@@ -121,13 +141,58 @@ const claude: ProviderSpec = {
   bin: "claude",
   supportsResume: true,
   blurb: "Anthropic Claude Code — full session continuity + cost reporting",
-  build(task, { model, resumeSessionId }) {
-    const args = ["-p", task, "--output-format", "json", "--dangerously-skip-permissions"];
+  build(task, { model, resumeSessionId, stream }) {
+    const streaming = Boolean(stream);
+    // stream-json requires --verbose alongside -p; otherwise identical argv.
+    const args = streaming
+      ? ["-p", task, "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"]
+      : ["-p", task, "--output-format", "json", "--dangerously-skip-permissions"];
     if (model) args.push("--model", model);
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     return {
       args,
       parse: (o) => {
+        if (streaming) {
+          // Stream mode: the reverse line scan below false-matches intermediate
+          // events (every one carries a string session_id), so NEVER run it.
+          // Only a real result event is a valid reply.
+          const fromEvents = extractResultEvent(o.stdout.trim());
+          if (fromEvents) return fromEvents;
+
+          // No result event (the fake-success bug): salvage the session id from
+          // the last event that carries one (id only, never its text), and
+          // return a capped diagnostic — not the raw NDJSON stream.
+          let sessionId: string | undefined;
+          for (const line of o.stdout.trim().split("\n").reverse()) {
+            const t = line.trim();
+            if (!t.startsWith("{")) continue;
+            try {
+              const j = JSON.parse(t);
+              if (j && typeof j.session_id === "string") {
+                sessionId = j.session_id;
+                break;
+              }
+            } catch {
+              /* not this line */
+            }
+          }
+          // Prefer stderr; a stream-json stdout blob must never reach the chat.
+          const stderr = o.stderr.trim();
+          const diag = stderr || o.stdout.trim().slice(0, 400);
+          return {
+            text: diag
+              ? `⚠️ Couldn't parse the agent's reply (exit ${o.code}). First bytes:\n${diag.slice(0, 400)}`
+              : `claude exited with code ${o.code}`,
+            isError: true,
+            ...(sessionId ? { sessionId } : {}),
+            // A stale --resume id is a CLI-level diagnostic printed to STDERR.
+            // NEVER derive it from the model's own stream output — tool results,
+            // greps and 404s can contain "not found"/"no ... session" and would
+            // false-match here, silently re-running a task that already executed
+            // side effects (the invariant documented on RunResult.staleSession).
+            staleSession: o.code !== 0 && STALE_SESSION_RE.test(stderr),
+          };
+        }
         // The CLI can print stray lines around the JSON payload; scan from the
         // LAST line backwards for something that parses with the expected
         // result/session_id shape, and only fall back to raw text if nothing does.
@@ -175,6 +240,38 @@ const claude: ProviderSpec = {
         };
       },
     };
+  },
+  // claude stream-json: assistant events carry a message.content block array.
+  progressFromEvent(ev) {
+    const e = ev as any;
+    if (!e || e.type !== "assistant") return undefined;
+    const content = e.message?.content;
+    if (!Array.isArray(content)) return undefined;
+    const tools: string[] = [];
+    let textConcat = "";
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "tool_use" && typeof block.name === "string") {
+        const input = block.input && typeof block.input === "object" ? block.input : {};
+        const name: string = block.name;
+        let hint = "";
+        if (typeof input.file_path === "string") {
+          hint = `: ${basename(input.file_path)}`;
+        } else if (name === "Bash" && input.command != null) {
+          hint = `: ${String(input.command).slice(0, 60)}`;
+        } else if ((name === "Grep" || name === "Glob") && input.pattern != null) {
+          hint = `: ${String(input.pattern)}`;
+        }
+        tools.push(`→ ${name}${hint}`);
+      } else if (block.type === "text" && typeof block.text === "string") {
+        textConcat += block.text;
+      }
+      // thinking / other blocks are intentionally ignored (no chat noise).
+    }
+    if (tools.length) return { kind: "tool", summary: tools.join(", ").slice(0, 200) };
+    const t = textConcat.trim();
+    if (t) return { kind: "text", summary: t.slice(0, 100) };
+    return undefined;
   },
 };
 
@@ -247,6 +344,19 @@ const codex: ProviderSpec = {
         }
       },
     };
+  },
+  // codex --json stdout is already NDJSON; summarize completed items only.
+  progressFromEvent(ev) {
+    const e = ev as any;
+    if (!e || e.type !== "item.completed" || !e.item || typeof e.item !== "object") return undefined;
+    const item = e.item;
+    if (item.type === "command_execution" && item.command != null) {
+      return { kind: "tool", summary: `→ ran: ${String(item.command).slice(0, 60)}` };
+    }
+    if (item.type === "file_change" || item.type === "patch") {
+      return { kind: "tool", summary: "→ edited files" };
+    }
+    return undefined;
   },
 };
 
@@ -332,7 +442,10 @@ function runOnce(
   timeoutMs: number,
   resumeSessionId: string | undefined,
 ): Promise<RunResult> {
-  const call = spec.build(task, { model: opts.model, resumeSessionId });
+  // Streaming is only meaningful when the caller wants progress AND the spec
+  // knows how to map events; otherwise argv stays byte-identical to json mode.
+  const stream = Boolean(opts.onProgress) && Boolean(spec.progressFromEvent);
+  const call = spec.build(task, { model: opts.model, resumeSessionId, stream });
   return new Promise<RunResult>((resolve) => {
     const isWin = process.platform === "win32";
     // Unix: detached gives the child its own process group, so on timeout we
@@ -380,11 +493,14 @@ function runOnce(
       call.cleanup?.();
       resolve(r);
     };
-    const timer = setTimeout(() => {
+    // Shared kill path for both the timeout and an external cancel: salvage the
+    // opaque resume id from partial output, tree-kill the child, then finish.
+    // The `settled` no-op protection in finish makes a late/double call safe.
+    const killAndFinish = (text: string, flags: { timedOut?: boolean; cancelled?: boolean }) => {
       // Codex emits `thread.started` near the beginning of its JSONL stream.
       // Preserve that id before killing a genuinely long run so the next
-      // WhatsApp request can resume the same thread. The final timeout text
-      // still wins; only the opaque resume id is recovered from partial output.
+      // WhatsApp request can resume the same thread. The final text still wins;
+      // only the opaque resume id is recovered from partial output.
       let sessionId: string | undefined;
       try {
         sessionId = call.parse({ stdout, stderr, code: null }).sessionId;
@@ -408,13 +524,45 @@ function runOnce(
         }
       }
       finish({
-        text: `Task timed out after ${timeoutMs / 1000}s and was killed.`,
+        text,
         isError: true,
-        timedOut: true,
+        ...flags,
         ...(sessionId ? { sessionId } : {}),
       });
-    }, timeoutMs);
-    child.stdout?.on("data", (d) => (stdout += d.toString()));
+    };
+    const timer = setTimeout(
+      () => killAndFinish(`Task timed out after ${timeoutMs / 1000}s and was killed.`, { timedOut: true }),
+      timeoutMs,
+    );
+    // Hand the caller a cancel handle: same tree-kill, resolves cancelled:true.
+    opts.onSpawn?.({
+      cancel: (reason) => killAndFinish(reason ?? "Task was cancelled.", { cancelled: true }),
+      pid: child.pid,
+    });
+    // When progress is wanted, split stdout into complete NDJSON lines and map
+    // each to a synthesized summary. Failures (non-JSON, throwing cb) are
+    // swallowed — progress must never break the run.
+    const wantProgress = Boolean(opts.onProgress) && Boolean(spec.progressFromEvent);
+    let lineBuf = "";
+    child.stdout?.on("data", (d) => {
+      const s = d.toString();
+      stdout += s;
+      if (!wantProgress) return;
+      lineBuf += s;
+      let nl: number;
+      while ((nl = lineBuf.indexOf("\n")) >= 0) {
+        const line = lineBuf.slice(0, nl).trim();
+        lineBuf = lineBuf.slice(nl + 1);
+        if (!line.startsWith("{")) continue;
+        try {
+          const ev = JSON.parse(line);
+          const p = spec.progressFromEvent!(ev);
+          if (p) opts.onProgress!(p);
+        } catch {
+          /* not JSON / cb error — never break the run */
+        }
+      }
+    });
     child.stderr?.on("data", (d) => (stderr += d.toString()));
     child.on("error", (err) =>
       finish({
@@ -442,7 +590,7 @@ export function getProvider(name: string): Provider | undefined {
       // Stale --resume id (provider lost/expired the session): retry ONCE
       // fresh and tell the caller to drop its stored session id. Gated on the
       // parse-level staleSession flag, never on the result text itself.
-      if (first.isError && !first.timedOut && resumeSessionId && first.staleSession) {
+      if (first.isError && !first.timedOut && !first.cancelled && resumeSessionId && first.staleSession) {
         const retry = await runOnce(spec, task, opts, timeoutMs, undefined);
         return { ...retry, resetSession: true };
       }

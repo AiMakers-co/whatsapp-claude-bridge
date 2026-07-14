@@ -143,8 +143,12 @@ export function delayedReplyText(text: string): string {
  * One raw attempt on the CURRENT socket with a caller-supplied message id.
  * Throws on failure. The caller must have called rememberSent(id) BEFORE the
  * first attempt with this id.
+ *
+ * `skipStore` skips ONLY the recordMessage() call (marker, rememberOutgoing and
+ * touchContact stay): ephemeral ack/progress lines must not enter the JSONL
+ * transcript, or formatHistory would feed "⏳ →…" noise into later turns.
  */
-async function sendOnce(jid: string, text: string, id: string): Promise<void> {
+async function sendOnce(jid: string, text: string, id: string, skipStore = false): Promise<void> {
   if (!deps) throw new Error("outbound layer not initialised");
   const sock = deps.getSock();
   if (!sock || !deps.isConnected()) throw new Error("not connected");
@@ -155,14 +159,16 @@ async function sendOnce(jid: string, text: string, id: string): Promise<void> {
   rememberOutgoing(sent ?? undefined); // backs getMessage for peer retry receipts
   // Persist our own outgoing reply (echoes are filtered via sentIds, so
   // recording here is the only place this message is ever stored).
-  recordMessage(jid, {
-    id,
-    ts: Math.floor(Date.now() / 1000),
-    fromMe: true,
-    sender: jidNormalizedUser(sock.user?.id ?? ""),
-    senderName: "You",
-    text: stripAutomationMarker(text),
-  });
+  if (!skipStore) {
+    recordMessage(jid, {
+      id,
+      ts: Math.floor(Date.now() / 1000),
+      fromMe: true,
+      sender: jidNormalizedUser(sock.user?.id ?? ""),
+      senderName: "You",
+      text: stripAutomationMarker(text),
+    });
+  }
   touchContact(jid);
 }
 
@@ -304,21 +310,66 @@ function scheduleDrain(): void {
 }
 
 /**
+ * Decide whether an ephemeral (ack/progress) send must be dropped rather than
+ * attempted. Ephemeral lines never queue and never overtake durable sends, so
+ * they are blocked when offline, when logged out, or when this jid already has
+ * durable sends waiting (per-jid FIFO — an ephemeral must not jump the queue).
+ * Pure and exported for tests.
+ */
+export function ephemeralSendBlocked(
+  connected: boolean,
+  loggedOut: boolean,
+  jidHasQueuedSends: boolean,
+): boolean {
+  return !connected || loggedOut || jidHasQueuedSends;
+}
+
+/**
  * Send `text` to `jid`, chunked, resilient. NEVER throws — a message that
  * can't be delivered within the retry window lands in the pending queue and
  * is flushed on the next successful connect (or by the drain timer).
  * Chunk-order invariant: once one chunk is queued, every later chunk of the
  * same message is queued too — a later chunk never overtakes an earlier one.
+ *
+ * `ephemeral` marks throwaway ack/progress lines: they are attempted ONCE per
+ * chunk (no retry, no queue) and never persisted to the transcript, and are
+ * dropped outright when ephemeralSendBlocked() says so — so they can never
+ * overtake a queued durable send or land "(delayed)" after a reconnect.
  */
 export async function safeSend(
   jid: string,
   text: string,
-  options: { guard?: SendGuard } = {},
+  options: { guard?: SendGuard; ephemeral?: boolean } = {},
 ): Promise<SendResult> {
   const { guard } = options;
   const ids: string[] = [];
   const sentIds: string[] = [];
   if (!guardIsValid(guard)) return { delivered: false, ids, sentIds };
+  if (options.ephemeral) {
+    if (
+      ephemeralSendBlocked(
+        Boolean(deps?.isConnected()),
+        Boolean(deps?.loggedOut()),
+        loadQueue().some((e) => e.jid === jid),
+      )
+    ) {
+      return { delivered: false, ids, sentIds };
+    }
+    for (const part of chunkForWhatsApp(text)) {
+      if (!guardIsValid(guard)) return { delivered: false, ids, sentIds };
+      const id = generateMessageID();
+      deps?.rememberSent(id);
+      ids.push(id);
+      try {
+        await sendOnce(jid, part, id, true);
+        sentIds.push(id);
+      } catch {
+        // Single attempt only — drop the rest, never retry or queue.
+        return { delivered: false, ids, sentIds };
+      }
+    }
+    return { delivered: true, ids, sentIds };
+  }
   let queueRest = false;
   for (const part of chunkForWhatsApp(text)) {
     if (!guardIsValid(guard)) return { delivered: false, ids, sentIds };

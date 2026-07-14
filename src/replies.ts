@@ -45,6 +45,28 @@ export function hasBotReplyPrefix(text: string, prefixes: string[]): boolean {
   });
 }
 
+/**
+ * Neutralize any configured call-sign trigger token embedded in free text
+ * (a job note derived from user/agent-authored text) before it goes into a
+ * bridge-composed notice. A notice is a fromMe frame; the loop-barrier rule is
+ * "never interpolate a LIVE trigger token into a notice — labels only". We keep
+ * the token visually intact but split it with the invisible AUTOMATION_MARKER
+ * so another local automation's exact-string matcher can no longer fire on it.
+ */
+export function neutralizeTriggerTokens(text: string, triggers: readonly string[]): string {
+  let out = text;
+  for (const trig of triggers) {
+    const token = (trig ?? "").trim();
+    if (token.length < 2) continue; // nothing (or a single char) to split
+    const re = new RegExp(
+      `(^|\\s)(${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})(?=\\s|$|[:;,.!?])`,
+      "gi",
+    );
+    out = out.replace(re, (_m, pre: string, tok: string) => `${pre}${tok[0]}${AUTOMATION_MARKER}${tok.slice(1)}`);
+  }
+  return out;
+}
+
 /** Human-readable label for the agent selected by a trigger/provider. */
 export function agentReplyLabel(trigger: string | undefined, provider: string): string {
   if (trigger) {

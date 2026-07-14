@@ -15,7 +15,10 @@ export type ConversationControl =
   | { kind: "new" }
   | { kind: "status" }
   | { kind: "cd"; path: string }
-  | { kind: "use"; provider: string };
+  | { kind: "use"; provider: string }
+  | { kind: "jobs" }
+  | { kind: "kill"; id: string }
+  | { kind: "job"; task: string };
 
 export function parseConversationControl(text: string): ConversationControl | undefined {
   const trimmed = text.trim();
@@ -27,18 +30,27 @@ export function parseConversationControl(text: string): ConversationControl | un
   if (cd) return { kind: "cd", path: (cd[1] ?? "").trim() };
   const use = /^\/use(?:\s+([\s\S]+))?$/i.exec(trimmed);
   if (use) return { kind: "use", provider: (use[1] ?? "").trim() };
+  // Background-job verbs. `\b` keeps the adjacency traps conversational:
+  // "/killer feature" is not /kill, "/jobsite tomorrow" / "/jobless" is not
+  // /job (and /job's own \b keeps "/jobs" from matching it — /jobs is a known
+  // verb below). /kill takes only the FIRST whitespace-token as the job id
+  // (lowercased); /job takes all trailing text as the task.
+  const kill = /^\/kill\b\s*([\s\S]*)$/i.exec(trimmed);
+  if (kill) return { kind: "kill", id: ((kill[1] ?? "").trim().split(/\s+/)[0] ?? "").toLowerCase() };
+  const job = /^\/job\b\s*([\s\S]*)$/i.exec(trimmed);
+  if (job) return { kind: "job", task: (job[1] ?? "").trim() };
   // Known verbs tolerate trailing text (R7): "/stop now", "/new please" and
   // "/status?" execute the verb (args ignored, matching the dedicated-group
   // path) instead of running as agent tasks in a sticky chat. The \b keeps
   // "/stopped" or "/chats" conversational; /chat keeps its <rest> semantics
   // (the rest becomes the first prompt of the activated conversation).
-  const match = /^\/(chat|talk|stop|new|status)\b\s*([\s\S]*)$/i.exec(trimmed);
+  const match = /^\/(chat|talk|stop|new|status|jobs)\b\s*([\s\S]*)$/i.exec(trimmed);
   if (!match) return undefined;
   const kind = match[1].toLowerCase();
   if (kind === "chat" || kind === "talk") {
     return { kind: "chat", rest: (match[2] ?? "").trim() };
   }
-  return { kind: kind as "stop" | "new" | "status" };
+  return { kind: kind as "stop" | "new" | "status" | "jobs" };
 }
 
 export function startConversation(
@@ -104,10 +116,14 @@ export interface GroupCommand {
  */
 export function parseGroupCommand(body: string, hasAttachment: boolean): GroupCommand | undefined {
   if (!body.startsWith("/")) return undefined;
-  const [cmd, ...rest] = body.slice(1).split(/\s+/);
+  // Split ONLY the command word off the front; keep the remainder verbatim so a
+  // line-structured task ("/job Run these:\n1. build\n2. deploy") reaches the
+  // agent with its newlines and indentation intact — matching the mention-path
+  // /job parser. The previous `split(/\s+/).join(" ")` flattened all whitespace.
+  const match = /^\/(\S*)\s*([\s\S]*)$/.exec(body);
   return {
-    cmd: (cmd ?? "").toLowerCase(),
-    arg: rest.join(" ").trim(),
+    cmd: (match?.[1] ?? "").toLowerCase(),
+    arg: (match?.[2] ?? "").trim(),
     droppedAttachment: hasAttachment,
   };
 }

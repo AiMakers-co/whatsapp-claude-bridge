@@ -80,9 +80,29 @@ There are two independent trigger paths, both in `index.ts`:
 - `/use <provider>` — switch agent CLI (claude/codex/gemini/grok) for this
   chat. Works in command groups and sticky chats.
 - `/status` — show provider, current dir, session state, and per-agent lane activity.
+- `/job <task>` — run a task as a background job instead of inline: it replies
+  `🚀 Job <id> started …` immediately, frees the lane, then posts the result to
+  this chat when done. Jobs run a FRESH agent session in this chat's working
+  directory (no conversation memory — put everything the task needs in the text).
+- `/jobs` — list this chat's background jobs (running/queued first), with a
+  `(+N in other chats)` footer. Status glyphs: ✅ done, ⚠️ error, ⏱ timeout,
+  🛑 killed, 💤 interrupted (by a restart), 🚫 superseded, 📪 suppressed.
+- `/kill <id>` — kill a running job (its process tree) or cancel a queued one.
+  `/kill` also suppresses that job's result. See the semantics table below.
+- The agent can also **delegate** long work itself: when a normal task would
+  take more than about a minute (builds, full test suites, big refactors,
+  research sweeps), it spins the work off as a background job and replies fast
+  with a `🚀 Started job <id>` line — same result-when-done behavior as `/job`.
 - Known commands never run as agent tasks — even with trailing words
   ("/stop now") or an attachment. In command groups NO `/`-leading message
   ever runs as a task; in sticky chats, unknown `/`-text stays conversational.
+- **Ack + progress messages** are throwaway status lines, never queued offline
+  and never recorded to the transcript: a `🤖 On it…` ack fires the instant a
+  task is accepted (silence it with `ACK_ENABLED=0`), and while a long task runs
+  a coalesced `⏳ …` progress rail reports what the agent is doing. Tune the rail
+  with `PROGRESS_INTERVAL_SECONDS` (delay before the first line; `0` disables it
+  and keeps claude in plain json mode) and `PROGRESS_MAX_UPDATES`. Job settings:
+  `JOB_TIMEOUT_SECONDS`, `MAX_CONCURRENT_JOBS`, `MAX_QUEUED_JOBS`.
 - Each agent (call sign in ordinary chats, provider in command groups) is an
   independent execution LANE per chat: `@computer` and `@codex` in one chat run
   CONCURRENTLY, like separate terminals. Within one lane, turns stay strictly
@@ -140,6 +160,24 @@ first.
   operational notice.
   This is not a bug and not scope creep to be reverted — if asked to touch
   this area again, preserve the fromMe-only invariant above all else.
+- **Background-job control semantics (do not blur these):**
+  - `/kill <id>` is **job-scoped**: it kills the job's process tree AND suppresses
+    its result. It bumps no generation and touches no chat lane or session.
+  - `/stop`, `/cd`, `/use` (and a group `/new`) suppress a running job's
+    **delivery** via its guard, but the process keeps running to completion and
+    stays visible in `/jobs`; its result is retained as 📪 suppressed. They never
+    kill a job — only `/kill` kills.
+  - A **loop-guard trip** touches jobs not at all — it clears queued chat turns
+    and pauses the tripped lane, but running jobs keep running and keep delivering.
+  - Jobs **always run FRESH sessions** — never `--resume`, never session
+    writeback. Chat-lane FIFO and per-lane session continuity are unchanged by
+    jobs; the two never share state.
+  - Jobs **interrupted by a restart are never auto-rerun** (they may already have
+    made changes) — the user gets one 💤 notice and re-issues `/job` if wanted.
+    A queued job that had not started is re-admitted after restart.
+  - Ephemeral sends (ack + progress `⏳`/`🤖`) are **never** enqueued to
+    pending-sends and **never** recorded to the transcript, so a reconnect never
+    replays a stale ack and future turns never see progress noise as context.
 - The bridge runs Claude with `--dangerously-skip-permissions` **by design** — that
   is the whole point (autonomous execution from a text). Make sure the user
   understands `WORKDIR` is where that power applies.

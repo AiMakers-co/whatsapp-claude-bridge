@@ -93,6 +93,63 @@ test("group command parsing closes the attachment and mention bypasses", () => {
   assert.equal(parseGroupCommand("", true), undefined);
 });
 
+test("parses the background-job verbs and keeps adjacency traps conversational", () => {
+  // §5.27: /jobs, /kill, /job as closed-set verbs; the six existing verbs and
+  // their prefix-overlap traps still behave.
+  assert.deepEqual(parseConversationControl("/jobs"), { kind: "jobs" });
+  assert.deepEqual(parseConversationControl("/jobs now"), { kind: "jobs" }); // R7 trailing tolerance
+  assert.deepEqual(parseConversationControl("/kill j4"), { kind: "kill", id: "j4" });
+  assert.deepEqual(parseConversationControl("/kill J4 now"), { kind: "kill", id: "j4" }); // lowercased, trailing ignored
+  assert.deepEqual(parseConversationControl("/kill"), { kind: "kill", id: "" });
+  assert.deepEqual(parseConversationControl("/job build the site"), {
+    kind: "job",
+    task: "build the site",
+  });
+  assert.deepEqual(parseConversationControl("/job"), { kind: "job", task: "" });
+  // Adjacency trap: "/jobs" must be the jobs verb, NEVER {kind:"job", task:"s"}.
+  assert.notEqual(parseConversationControl("/jobs")?.kind, "job");
+  // F8: prefix-overlapping words stay conversational (undefined → agent task).
+  assert.equal(parseConversationControl("/jobsite tomorrow"), undefined);
+  assert.equal(parseConversationControl("/killer feature"), undefined);
+  assert.equal(parseConversationControl("/jobless"), undefined);
+  // No regression on the existing six verbs.
+  assert.deepEqual(parseConversationControl("/stop"), { kind: "stop" });
+  assert.deepEqual(parseConversationControl("/new"), { kind: "new" });
+  assert.deepEqual(parseConversationControl("/status"), { kind: "status" });
+  assert.deepEqual(parseConversationControl("/chat"), { kind: "chat", rest: "" });
+  assert.deepEqual(parseConversationControl("/cd /tmp"), { kind: "cd", path: "/tmp" });
+  assert.deepEqual(parseConversationControl("/use codex"), { kind: "use", provider: "codex" });
+});
+
+test("group command parsing surfaces /job as cmd job with the task as arg", () => {
+  // §5.28: parseGroupCommand needs no change — any leading "/" is already
+  // command-shaped, so /job/kill/jobs fall through to the group handler.
+  assert.deepEqual(parseGroupCommand("/job build x", false), {
+    cmd: "job",
+    arg: "build x",
+    droppedAttachment: false,
+  });
+  assert.deepEqual(parseGroupCommand("/kill j7k2", false), {
+    cmd: "kill",
+    arg: "j7k2",
+    droppedAttachment: false,
+  });
+  assert.deepEqual(parseGroupCommand("/jobs", false), {
+    cmd: "jobs",
+    arg: "",
+    droppedAttachment: false,
+  });
+  // Line-structured task text must survive verbatim (newlines + indentation),
+  // matching the mention-path /job parser — the old split(/\s+/).join(" ")
+  // flattened it into one line and broke step lists / code / heredocs.
+  const multiline = "/job Run these steps:\n1. build\n2. copy dist/ to /srv\n3. restart";
+  assert.deepEqual(parseGroupCommand(multiline, false), {
+    cmd: "job",
+    arg: "Run these steps:\n1. build\n2. copy dist/ to /srv\n3. restart",
+    droppedAttachment: false,
+  });
+});
+
 test("a loop trip preserves the generation while /stop bumps it", () => {
   // F4: the trip transition must not invalidate the running task's reply.
   const tripped: StickyState = {

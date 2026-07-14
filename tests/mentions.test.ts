@@ -19,6 +19,7 @@ test("matches configured mention tokens without matching substrings", () => {
   assert.equal(matchMention("please use @codex for this", routes)?.provider, "codex");
   assert.equal(matchMention("please use @codex for this", routes)?.model, "gpt-5.6");
   assert.equal(matchMention("@computer: take a look", routes)?.provider, "claude");
+  assert.equal(matchMention("@computer; please check this chat", routes)?.provider, "claude");
   assert.equal(matchMention("email support@computerstore.com", routes), undefined);
   assert.equal(matchMention("see @codex.com", routes), undefined);
 });

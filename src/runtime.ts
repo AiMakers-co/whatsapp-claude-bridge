@@ -10,7 +10,7 @@ import { pendingSendsFile } from "./outbound.js";
 export interface TaskRecord {
   jid: string;
   chatName?: string;
-  kind: "group" | "mention";
+  kind: "group" | "mention" | "job";
   preview: string;
   startedAt: number;
   endedAt?: number;
@@ -51,7 +51,7 @@ export const runtime = {
 export function taskStarted(init: {
   jid: string;
   chatName?: string;
-  kind: "group" | "mention";
+  kind: "group" | "mention" | "job";
   preview: string;
   provider: string;
 }): TaskRecord {

@@ -18,6 +18,7 @@ import {
 import { rememberOutgoing } from "./retransmit.js";
 import { markAutomated, prefixReply } from "./replies.js";
 import { getConfigPayload, saveConfig, readClaudeMd, writeClaudeMd } from "./settings.js";
+import type { JobRecord } from "./jobs.js";
 
 /**
  * Local control API. Loopback-only (127.0.0.1) HTTP server so any local
@@ -41,6 +42,8 @@ interface ApiDeps {
   queuedTurns: () => number;
   activeTurns: () => number;
   rememberSent: (id?: string | null) => void;
+  /** Read-only snapshot of the background-job table (GET /jobs). */
+  jobsSnapshot: () => JobRecord[];
 }
 
 let started = false;
@@ -226,6 +229,17 @@ async function handle(req: IncomingMessage, res: ServerResponse, deps: ApiDeps):
         status: t.status,
         costUsd: t.costUsd,
         provider: t.provider,
+      })),
+    });
+    return;
+  }
+
+  // ── GET /jobs — read-only background-job table snapshot ────────
+  if (route === "GET /jobs") {
+    json(res, 200, {
+      jobs: deps.jobsSnapshot().map((j) => ({
+        ...j,
+        task: j.task.length > 200 ? j.task.slice(0, 200) : j.task,
       })),
     });
     return;

@@ -162,6 +162,75 @@ if (process.env.MEDIA_MAX_MB && mediaMaxMb !== rawMediaMaxMb) {
   console.warn(`MEDIA_MAX_MB invalid (${process.env.MEDIA_MAX_MB}) — using 16 MB.`);
 }
 
+// Progress rail (Step 3). PROGRESS_INTERVAL_SECONDS is the delay before the
+// FIRST live-progress line; an explicit "0" disables progress streaming
+// entirely (claude argv stays in json mode — the production kill switch),
+// otherwise it clamps to 5–600s. Invalid values warn and fall back to 15s.
+const rawProgressInterval = process.env.PROGRESS_INTERVAL_SECONDS?.trim();
+let progressIntervalMs: number;
+if (rawProgressInterval === "0") {
+  progressIntervalMs = 0;
+} else if (!rawProgressInterval) {
+  progressIntervalMs = 15_000;
+} else {
+  const n = Number(rawProgressInterval);
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`PROGRESS_INTERVAL_SECONDS invalid (${rawProgressInterval}) — using 15s.`);
+    progressIntervalMs = 15_000;
+  } else {
+    const clamped = Math.min(Math.max(n, 5), 600);
+    if (clamped !== n) {
+      console.warn(`PROGRESS_INTERVAL_SECONDS out of range (${n}) — clamped to ${clamped}s.`);
+    }
+    progressIntervalMs = clamped * 1000;
+  }
+}
+
+const rawProgressMaxUpdates = Number(process.env.PROGRESS_MAX_UPDATES ?? 8);
+const progressMaxUpdates =
+  Number.isInteger(rawProgressMaxUpdates) && rawProgressMaxUpdates >= 1
+    ? Math.min(rawProgressMaxUpdates, 30)
+    : 8;
+if (process.env.PROGRESS_MAX_UPDATES && progressMaxUpdates !== rawProgressMaxUpdates) {
+  console.warn(
+    `PROGRESS_MAX_UPDATES invalid (${process.env.PROGRESS_MAX_UPDATES}) — using ${progressMaxUpdates}.`,
+  );
+}
+
+// Dispatch-time acknowledgement ("🤖 On it…"). "0"/"false" turns it off.
+const ackRaw = (process.env.ACK_ENABLED ?? "true").trim().toLowerCase();
+const ackEnabled = ackRaw !== "false" && ackRaw !== "0";
+
+// Background jobs (Step 5 — declared now, wired later). JOB_TIMEOUT_SECONDS
+// floors at 60s; concurrency and queue depth clamp to sane ranges.
+const rawJobTimeoutMs = (Number(process.env.JOB_TIMEOUT_SECONDS) || 3600) * 1000;
+const jobTimeoutMs = Math.max(rawJobTimeoutMs, 60_000);
+if (jobTimeoutMs !== rawJobTimeoutMs) {
+  console.warn(`JOB_TIMEOUT_SECONDS too low (${rawJobTimeoutMs / 1000}s) — clamped to 60s minimum.`);
+}
+
+const rawMaxConcurrentJobs = Number(process.env.MAX_CONCURRENT_JOBS ?? 3);
+const maxConcurrentJobs =
+  Number.isInteger(rawMaxConcurrentJobs) && rawMaxConcurrentJobs >= 1
+    ? Math.min(rawMaxConcurrentJobs, 10)
+    : 3;
+if (process.env.MAX_CONCURRENT_JOBS && maxConcurrentJobs !== rawMaxConcurrentJobs) {
+  console.warn(
+    `MAX_CONCURRENT_JOBS invalid (${process.env.MAX_CONCURRENT_JOBS}) — using ${maxConcurrentJobs}.`,
+  );
+}
+
+const rawMaxQueuedJobs = Number(process.env.MAX_QUEUED_JOBS ?? 10);
+const maxQueuedJobs =
+  Number.isInteger(rawMaxQueuedJobs) && rawMaxQueuedJobs >= 1
+    ? Math.min(rawMaxQueuedJobs, 50)
+    : 10;
+if (process.env.MAX_QUEUED_JOBS && maxQueuedJobs !== rawMaxQueuedJobs) {
+  console.warn(
+    `MAX_QUEUED_JOBS invalid (${process.env.MAX_QUEUED_JOBS}) — using ${maxQueuedJobs}.`,
+  );
+}
+
 // Default agent CLI + model routing. Each provider reads its OWN model env so
 // codex never gets handed claude's model string (the root-cause bug: one shared
 // MODEL was passed to every provider). Legacy MODEL applies to the default
@@ -221,6 +290,22 @@ export const config = {
 
   /** Maximum turns waiting behind one active task in a chat. */
   conversationQueueLimit,
+
+  /**
+   * Live-progress rail. progressIntervalMs is the delay before the first
+   * "⏳ …" line (0 disables progress streaming entirely — claude stays in
+   * json mode); progressMaxUpdates caps how many progress lines a turn emits.
+   */
+  progressIntervalMs,
+  progressMaxUpdates,
+
+  /** Dispatch-time "🤖 On it…" acknowledgement (ephemeral). */
+  ackEnabled,
+
+  /** Background job limits (wired in Step 5). */
+  jobTimeoutMs,
+  maxConcurrentJobs,
+  maxQueuedJobs,
 
   /** Auto-open the QR image in the OS viewer while linking. */
   qrAutoOpen: (process.env.QR_AUTO_OPEN ?? "true").toLowerCase() !== "false",

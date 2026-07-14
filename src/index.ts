@@ -11,7 +11,7 @@ import makeWASocket, {
 import { rememberOutgoing, getForRetry, makeRetryCounterCache } from "./retransmit.js";
 import pino from "pino";
 import { config, monitoredGroupConfigs, type GroupConfig } from "./config.js";
-import { getProvider, providerNames } from "./providers.js";
+import { getProvider, providerNames, type ProgressEvent } from "./providers.js";
 import {
   claimMentionSession,
   getMentionSession,
@@ -69,6 +69,7 @@ import {
   hasAutomationMarker,
   hasBotReplyPrefix,
   markAutomated,
+  neutralizeTriggerTokens,
   prefixReply,
 } from "./replies.js";
 import {
@@ -83,9 +84,9 @@ import {
 } from "./media.js";
 import { log } from "./logger.js";
 import { showQr } from "./qr.js";
-import { mkdirSync, statSync } from "node:fs";
+import { mkdirSync, rmSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { startApi } from "./api.js";
 import {
   flushAllNow,
@@ -111,8 +112,12 @@ import {
   safeSend,
   flushPending,
   type SendGuard,
+  type SendResult,
 } from "./outbound.js";
 import { runtime, taskStarted, taskFinished } from "./runtime.js";
+import { ProgressReporter } from "./progress.js";
+import { formatJobsList, JobRunner, JobStore, sweepJobRequests, type JobRecord } from "./jobs.js";
+import type { RunResult } from "./providers.js";
 
 /** Per-chat conversation state: provider/call-sign sessions and working dir. */
 interface ChatState {
@@ -214,6 +219,156 @@ type BridgeTurnPayload = MentionTurnPayload | GroupTurnPayload;
 const turnJournal = new TurnJournal<BridgeTurnPayload>(
   resolve(config.authDir, "..", "data", "pending-turns.json"),
 );
+
+/**
+ * Background-job core (Step 5). Durable table + FIFO runner. Not yet reachable
+ * from any command surface (Step 6 wires /job, /kill, delegation) — instantiated
+ * now so recovery, delivery and the exit flush are in place. `deliver`,
+ * `notify` and `progressSend` are defined below; hoisted / const bindings are
+ * safe because the runner only ever calls them at job-completion time.
+ */
+const jobStore = new JobStore(resolve(config.authDir, "..", "data", "jobs.json"));
+const jobRunner = new JobRunner({
+  store: jobStore,
+  getProvider,
+  modelFor: (provider) => config.modelFor(provider),
+  isGuardValid: (guard) => guardMatchesState(chats.get(guard.chatKey), guard),
+  deliver: deliverJob,
+  notify: (remoteJid, text) => void safeSend(remoteJid, prefixReply("Bridge", text)),
+  progressSend: (job, text) =>
+    void safeSend(job.remoteJid, prefixReply(job.sourceLabel, `[${job.id}] ${text}`), {
+      guard: job.guard,
+      ephemeral: true,
+    }),
+  jobTimeoutMs: config.jobTimeoutMs,
+  maxConcurrent: config.maxConcurrentJobs,
+  maxQueued: config.maxQueuedJobs,
+  progressIntervalMs: config.progressIntervalMs,
+  progressMaxUpdates: config.progressMaxUpdates,
+});
+
+// The configured call-sign tokens, computed once. A job note is raw
+// user/agent-authored text; it is neutralized through these before it can be
+// embedded in ANY bridge notice (spawn ack, /jobs list is label-only, the
+// completion head, and the restart 💤/🚫 notices via the stored note).
+const configuredTriggerTokens: readonly string[] = config.mentionTriggers.map((r) => r.trigger);
+function safeJobNote(note: string): string {
+  return neutralizeTriggerTokens(note, configuredTriggerTokens);
+}
+
+/** Round elapsed job time to a compact "3m"/"45s" label for completion heads. */
+function formatJobElapsed(ms: number): string {
+  const secs = Math.max(1, Math.round(ms / 1000));
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.round(secs / 60);
+  return `${mins}m`;
+}
+
+/**
+ * Shared outbox-delivery step, extracted byte-for-byte from the two run
+ * closures (behavior-neutral). `mode:"mention"` keeps the self-chat/fileTarget
+ * resolution (files NEVER ship to a third-party chat the mention was typed in);
+ * `mode:"group"` delivers straight to the group. `stale` is recomputed from the
+ * guard so the same reset that suppresses the reply also holds the files.
+ */
+async function deliverTaskOutbox(opts: {
+  remoteJid: string;
+  guard: SendGuard;
+  taskOutbox: string;
+  outboxRoot: string;
+  mode: "group" | "mention";
+  bridgeReply: (text: string) => Promise<SendResult>;
+}): Promise<void> {
+  const { remoteJid, guard, taskOutbox, outboxRoot, mode, bridgeReply } = opts;
+  const stale = () => !guardMatchesState(chats.get(guard.chatKey), guard);
+  const liveSock = currentSock;
+  if (mode === "group") {
+    if (liveSock) {
+      const delivered = await flushOutbox(liveSock, remoteJid, taskOutbox, rememberSent, () => !stale());
+      if (!stale()) removeTaskOutbox(taskOutbox);
+      else orphanTaskOutbox(taskOutbox, outboxRoot);
+      if (delivered) await bridgeReply(delivered.summary);
+    } else {
+      orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
+    }
+    return;
+  }
+  // mode === "mention": self-detection is LID-aware — WhatsApp addresses your
+  // own chat by @lid, which does NOT equal the phone-format user id.
+  const selfJid = liveSock ? jidNormalizedUser(liveSock.user?.id ?? "") : "";
+  const selfLid = liveSock ? jidNormalizedUser((liveSock.user as any)?.lid ?? "") : "";
+  const isSelfChat = !!remoteJid && (remoteJid === selfJid || (!!selfLid && remoteJid === selfLid));
+  const fileTarget = isSelfChat ? remoteJid : selfJid;
+  let delivered: OutboxResult | null = null;
+  if (liveSock && fileTarget) {
+    delivered = await flushOutbox(liveSock, fileTarget, taskOutbox, rememberSent, () => !stale());
+    if (!stale()) removeTaskOutbox(taskOutbox);
+    else orphanTaskOutbox(taskOutbox, outboxRoot);
+  } else {
+    orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
+  }
+  if (delivered) {
+    if (isSelfChat) {
+      await bridgeReply(delivered.summary);
+    } else if (delivered.sentCount > 0) {
+      // Claim delivery only when something WAS delivered; the full summary
+      // (incl. any skips) goes to the self chat with the files.
+      await bridgeReply("📎 File(s) delivered to your personal chat.");
+      await safeSend(selfJid, prefixReply("Bridge", delivered.summary), { guard });
+    } else {
+      // Nothing sent (all skipped) — never claim delivery; surface the reasons.
+      await bridgeReply(`⚠️ Couldn't deliver file(s):\n${delivered.summary}`);
+    }
+  }
+}
+
+/**
+ * index.ts-side job completion. Re-checks the guard (a chat reset while the job
+ * ran suppresses delivery but RETAINS the stored result), then posts a durable,
+ * agent-labeled completion, records it so the next foreground turn's transcript
+ * includes it, and flushes any files the job left in its outbox.
+ */
+async function deliverJob(job: JobRecord, res: RunResult, elapsedMs: number): Promise<void> {
+  // A job flushes only its OWN private subdir of the workdir's outbox root —
+  // NEVER the shared root. Sharing the root would (a) ship loose files a
+  // concurrent turn hand-dropped, (b) let two jobs in one cwd flush each
+  // other's in-flight files, and (c) destroy the shared outbox/.sent + .orphaned
+  // quarantine (removeTaskOutbox/orphanTaskOutbox are written for per-task
+  // subdirs, and orphanTaskOutbox(root, root) is an EINVAL no-op). The subdir is
+  // per-job isolated, so a concurrent turn's isolateOrphans (loose FILES only)
+  // never touches it either.
+  const outboxRoot = join(job.cwd, "outbox");
+  const jobOutbox = join(outboxRoot, `job-${job.id}`);
+  const chat = chats.get(job.guard.chatKey);
+  if (!guardMatchesState(chat, job.guard)) {
+    jobRunner.markSuppressed(job.id);
+    orphanTaskOutbox(jobOutbox, outboxRoot); // hold any files — never leak into a reset chat
+    log.info(`Job ${job.id} finished but its chat was reset — result suppressed (retained in jobs.json).`);
+    return;
+  }
+  const mins = formatJobElapsed(elapsedMs);
+  const head = res.isError
+    ? `⚠️ Job ${job.id} ${res.timedOut ? "timed out" : "failed"} (${mins}) — ${job.note}`
+    : `✅ Job ${job.id} done (${mins}) — ${job.note}`;
+  const body = head + "\n\n" + res.text;
+  const sent = await safeSend(job.remoteJid, prefixReply(job.sourceLabel, body), { guard: job.guard });
+  if (sent.delivered) {
+    recordAgentReply(
+      job.remoteJid,
+      { label: job.sourceLabel, text: body, ts: Math.floor(Date.now() / 1000) },
+      sent,
+    );
+  }
+  // Delivery follows the origin chat's kind (group vs personal).
+  await deliverTaskOutbox({
+    remoteJid: job.remoteJid,
+    guard: job.guard,
+    taskOutbox: jobOutbox,
+    outboxRoot,
+    mode: monitoredGroups.has(job.remoteJid) ? "group" : "mention",
+    bridgeReply: (text) => safeSend(job.remoteJid, prefixReply("Bridge", text), { guard: job.guard }),
+  });
+}
 
 /**
  * Working dirs with a task in flight (cwd -> running count). `busy` is
@@ -517,6 +672,23 @@ function recoverDurableTurns(): void {
       log.error(`Recovered turn ${turn.id} failed to enqueue: ${e?.message ?? e}`);
     });
   }
+
+  // Background-job recovery runs INSIDE the barrier (before durableRecoveryReady
+  // flips): no live message — including a future /jobs — can race it, because
+  // everything buffers in deferredIncoming until the flag is set. Re-validate
+  // against LIVE config (provider still known, cwd still a dir, guard still
+  // valid), never the persisted copies.
+  jobRunner.recover({
+    providerKnown: (provider) => !!getProvider(provider),
+    cwdIsDir: (cwd) => {
+      try {
+        return !!cwd && statSync(cwd).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+    guardValid: (guard) => guardMatchesState(chats.get(guard.chatKey), guard),
+  });
 
   durableRecoveryReady = true;
   if (replayed || interrupted || dropped) {
@@ -828,6 +1000,7 @@ function exitWithFlush(sig: string, code: number): void {
   // Journal writes are async in normal operation (F6); this synchronous
   // variant exists ONLY for this process-exit path.
   turnJournal.flushSync();
+  jobStore.flushSync();
   process.exit(code);
 }
 process.on("SIGTERM", () => exitWithFlush("SIGTERM", 0)); // never delivered on Windows; harmless to register
@@ -854,6 +1027,7 @@ process.on("exit", () => {
     /* nothing more to do */
   }
   turnJournal.flushSync();
+  jobStore.flushSync();
 });
 
 /**
@@ -1613,6 +1787,60 @@ async function handleMention(
     return;
   }
 
+  // Background jobs — a '/'-verb must never reach provider.run. /kill and /job
+  // are job-scoped (no generation bump); command-spawned jobs carry a CHAT-WIDE
+  // guard only (no laneId) so they survive any lane's sticky /new and are
+  // suppressed only by chat-wide resets.
+  if (!recoveredPayload && control?.kind === "jobs") {
+    const chatKey = canonicalChatKey(remoteJid);
+    await bridgeReply(formatJobsList(jobRunner.list(chatKey), jobRunner.countsElsewhere(chatKey)));
+    return;
+  }
+  if (!recoveredPayload && control?.kind === "kill") {
+    if (!control.id) {
+      await bridgeReply("Usage: /kill <job id> — see /jobs");
+      return;
+    }
+    const outcome = jobRunner.kill(control.id);
+    await bridgeReply(
+      outcome === "killed"
+        ? `🛑 Job ${control.id} killed.`
+        : outcome === "cancelled-queued"
+          ? `🛑 Job ${control.id} cancelled before it started.`
+          : outcome === "already-done"
+            ? `Job ${control.id} already finished.`
+            : `No job ${control.id} here — /jobs lists them.`,
+    );
+    return;
+  }
+  if (!recoveredPayload && control?.kind === "job") {
+    if (!control.task) {
+      await bridgeReply("Usage: /job <task> — runs it in the background; /jobs to check, /kill <id> to stop.");
+      return;
+    }
+    const chatKey = canonicalChatKey(remoteJid);
+    const jobModel = matched.model ?? config.modelFor(matched.provider);
+    const note = safeJobNote(control.task.slice(0, 60));
+    const spawned = await jobRunner.spawn({
+      remoteJid,
+      chatKey,
+      sourceLabel,
+      provider: matched.provider,
+      ...(jobModel ? { model: jobModel } : {}),
+      cwd: chat.cwd,
+      task: control.task,
+      note,
+      origin: "command",
+      guard: { chatKey, generation: chat.generation },
+    });
+    await bridgeReply(
+      spawned.ok
+        ? `🚀 Job ${spawned.id} started — ${note}. /jobs to check, /kill ${spawned.id} to stop.`
+        : `⚠️ Couldn't start job: ${spawned.reason}.`,
+    );
+    return;
+  }
+
   // F8: /cd and /use are recognized in sticky/ordinary chats with the same
   // semantics as the dedicated-group handlers — they must NEVER ship to the
   // agent as task text. Unknown '/'-leading conversational text still does.
@@ -1799,6 +2027,18 @@ async function handleMention(
       safeSend(remoteJid, prefixReply(sourceLabel, text), { guard });
     const taskBridgeReply = (text: string) =>
       safeSend(remoteJid, prefixReply("Bridge", text), { guard });
+    // Dispatch-time ack (ephemeral, agent-labeled, no position info). Recovered
+    // turns get the ▶️ variant. Fire-and-forget — must not delay the attachment
+    // download / history load below.
+    if (config.ackEnabled) {
+      void safeSend(
+        remoteJid,
+        recoveredPayload
+          ? prefixReply("Bridge", "▶️ Resuming a saved turn from before the restart…")
+          : prefixReply(sourceLabel, "🤖 On it…"),
+        { guard, ephemeral: true },
+      );
+    }
     let incomingFilePath: string | undefined;
     if (attachment) {
       try {
@@ -1851,6 +2091,10 @@ async function handleMention(
   // Per-task private outbox: concurrent tasks sharing a workdir must never
   // sweep each other's in-flight files.
   const taskOutbox = join(outboxRoot, `task-${randomUUID().slice(0, 8)}`);
+  // Delegation drop-dir: a SIBLING of taskOutbox (so the outbox flush never
+  // ships job-request JSON to WhatsApp), still under outboxRoot so
+  // isolateOrphans (loose FILES only) never touches it.
+  const taskJobsDir = join(outboxRoot, basename(taskOutbox) + "-jobs");
   const warn = chat.pendingWarn;
   chat.pendingWarn = undefined;
 
@@ -1873,7 +2117,8 @@ async function handleMention(
     (latestAsk
       ? `The latest authorised ask (including any local attachment path):\n${latestAsk}`
       : `No specific words followed the mention — read the conversation above and offer whatever help is relevant.`) +
-    `\n\n[To send a file back, save it into ${taskOutbox} — it will be delivered and removed automatically.]`;
+    `\n\n[To send a file back, save it into ${taskOutbox} — it will be delivered and removed automatically.]` +
+    `\n[Long work: this chat expects a reply within about a minute. For anything longer (builds, full test suites, big refactors, research sweeps), do NOT do it inline — write one JSON file per job into ${taskJobsDir} shaped {"task":"<complete, self-contained instructions with all needed context and paths>","note":"<short label>"} and reply immediately saying what you delegated. Each file becomes a background job in this same working directory; its result will be posted to this chat when done. The job runs with a FRESH agent session — include everything it needs inside "task".]`;
 
   // Presence (and every later send) resolves the CURRENT socket via the
   // getter — long tasks outlive reconnects, so a captured sock goes stale.
@@ -1892,6 +2137,11 @@ async function handleMention(
     preview: (instruction || raw).replace(/\s+/g, " ").slice(0, 200),
     provider: provider.name,
   });
+  const reporter = new ProgressReporter(
+    (text) => safeSend(remoteJid, prefixReply(sourceLabel, text), { guard, ephemeral: true }),
+    config.progressIntervalMs,
+    config.progressMaxUpdates,
+  );
   try {
     if (stale()) {
       taskFinished(rec, { status: "cancelled" });
@@ -1899,12 +2149,18 @@ async function handleMention(
       return;
     }
     mkdirSync(taskOutbox, { recursive: true });
+    mkdirSync(taskJobsDir, { recursive: true });
     const res = await provider.run(
       task,
       {
         cwd: taskCwd,
         resumeSessionId: sessionAtDispatch,
         model: matched.model ?? config.modelFor(provider.name),
+        // Only wire progress when the rail is on: at 0, passing no onProgress
+        // keeps claude's argv in json mode (the production kill-switch).
+        ...(config.progressIntervalMs > 0
+          ? { onProgress: (ev: ProgressEvent) => { if (!stale()) reporter.push(ev); } }
+          : {}),
       },
       config.taskTimeoutMs,
     );
@@ -1935,7 +2191,36 @@ async function handleMention(
         "⚠️ " + res.text + (held ? "\n📎 Files it was writing were held (not sent) — see outbox/.orphaned/." : ""),
       );
     } else {
-      const replyText = (res.isError ? "⚠️ " : "") + res.text;
+      let replyText = (res.isError ? "⚠️ " : "") + res.text;
+      // Delegation: consume any job-request files this turn's agent dropped and
+      // spawn them as background jobs in the SAME workdir. Delegated jobs inherit
+      // the turn's FULL lane guard, so a sticky /new on this lane suppresses
+      // their delivery too. Append one status line per request to the reply.
+      // ONLY on a SUCCESSFUL turn — an errored/aborted turn may have written a
+      // half-formed job file just before it crashed; those files are still
+      // consumed (the finally rmSync) but spawn NOTHING.
+      if (!res.isError) {
+        const swept = sweepJobRequests(taskJobsDir);
+        for (const request of swept.requests) {
+          const jobModel = matched.model ?? config.modelFor(provider.name);
+          const spawned = await jobRunner.spawn({
+            remoteJid,
+            chatKey: guard.chatKey,
+            sourceLabel,
+            provider: provider.name,
+            ...(jobModel ? { model: jobModel } : {}),
+            cwd: taskCwd,
+            task: request.task,
+            note: safeJobNote(request.note),
+            origin: "delegated",
+            guard,
+          });
+          replyText += spawned.ok
+            ? `\n🚀 Started job ${spawned.id} — ${safeJobNote(request.note)}`
+            : `\n⚠️ Job file ignored: ${spawned.reason}`;
+        }
+        for (const err of swept.errors) replyText += `\n⚠️ Job file ignored: ${err}`;
+      }
       const sent = await taskAgentReply(replyText);
       if (!sent.delivered || stale()) {
         orphanTaskOutbox(taskOutbox, outboxRoot);
@@ -1950,44 +2235,17 @@ async function handleMention(
         sent,
       );
       // SECURITY: outbox files NEVER flush to someone ELSE's chat the mention
-      // was typed in — files go to the user's own chat. But when the trigger
-      // chat IS the user's own (note-to-self), that's where they belong and
-      // where the user expects them. Self-detection is LID-aware: WhatsApp now
-      // addresses your own chat by @lid, which does NOT equal the phone-format
-      // user id — comparing only that shipped files to a "different" chat.
-      const liveSock = currentSock;
-      const selfJid = liveSock ? jidNormalizedUser(liveSock.user?.id ?? "") : "";
-      const selfLid = liveSock ? jidNormalizedUser((liveSock.user as any)?.lid ?? "") : "";
-      const isSelfChat = !!remoteJid && (remoteJid === selfJid || (!!selfLid && remoteJid === selfLid));
-      const fileTarget = isSelfChat ? remoteJid : selfJid;
-      let delivered: OutboxResult | null = null;
-      if (liveSock && fileTarget) {
-        delivered = await flushOutbox(
-          liveSock,
-          fileTarget,
-          taskOutbox,
-          rememberSent,
-          () => !stale(),
-        );
-        if (!stale()) removeTaskOutbox(taskOutbox);
-        else orphanTaskOutbox(taskOutbox, outboxRoot);
-      } else {
-        orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
-      }
-      if (delivered) {
-        if (isSelfChat) {
-          await taskBridgeReply(delivered.summary);
-        } else if (delivered.sentCount > 0) {
-          // Claim delivery only when something WAS delivered; the full
-          // summary (incl. any skips) goes to the self chat with the files.
-          await taskBridgeReply("📎 File(s) delivered to your personal chat.");
-          await safeSend(selfJid, prefixReply("Bridge", delivered.summary), { guard });
-        } else {
-          // Nothing was sent (all skipped: too large / send failed) — never
-          // claim delivery; surface the skip reasons instead.
-          await taskBridgeReply(`⚠️ Couldn't deliver file(s):\n${delivered.summary}`);
-        }
-      }
+      // was typed in — files go to the user's own chat (self-chat resolution
+      // inside the helper). But when the trigger chat IS the user's own
+      // (note-to-self), that's where they belong and where the user expects them.
+      await deliverTaskOutbox({
+        remoteJid,
+        guard,
+        taskOutbox,
+        outboxRoot,
+        mode: "mention",
+        bridgeReply: taskBridgeReply,
+      });
     }
   } catch (e: any) {
     log.error(`[${remoteJid}] ${matched.trigger} error: ${e?.message ?? e}`);
@@ -1996,6 +2254,11 @@ async function handleMention(
     if (!stale()) await taskBridgeReply(`💥 ${e?.message ?? e}`);
     else taskFinished(rec, { status: "cancelled" });
   } finally {
+    reporter.stop();
+    // Consume the delegation drop-dir on every path (job files were already
+    // swept + spawned on the success path; here we drop the dir and any files
+    // left on the stale/timeout/error paths — spawning nothing).
+    rmSync(taskJobsDir, { recursive: true, force: true });
     cwdTaskFinished(taskCwd);
     await currentSock?.sendPresenceUpdate("paused", remoteJid).catch(() => {});
   }
@@ -2227,6 +2490,7 @@ async function startInner() {
         queuedTurns: () => turnQueue.totalWaiting(),
         activeTurns: () => turnQueue.active(),
         rememberSent,
+        jobsSnapshot: () => jobStore.snapshot(),
       });
     }
     if (connection === "close") {
@@ -2618,6 +2882,65 @@ async function handleIncomingInner(
           `Session: ${chat.sessions[chat.provider] ? "resumable" : "fresh"}\n` +
           `Agents: ${formatLaneStatuses(laneStatuses)}`,
       );
+    } else if (cmd === "jobs") {
+      const chatKey = canonicalChatKey(remoteJid);
+      await bridgeReply(formatJobsList(jobRunner.list(chatKey), jobRunner.countsElsewhere(chatKey)));
+    } else if (cmd === "kill") {
+      if (!arg) {
+        await bridgeReply("Usage: /kill <job id> — see /jobs");
+      } else {
+        const id = arg.split(/\s+/)[0]!.toLowerCase();
+        const outcome = jobRunner.kill(id);
+        await bridgeReply(
+          outcome === "killed"
+            ? `🛑 Job ${id} killed.`
+            : outcome === "cancelled-queued"
+              ? `🛑 Job ${id} cancelled before it started.`
+              : outcome === "already-done"
+                ? `Job ${id} already finished.`
+                : `No job ${id} here — /jobs lists them.`,
+        );
+      }
+    } else if (cmd === "job") {
+      if (!arg) {
+        await bridgeReply("Usage: /job <task> — runs it in the background; /jobs to check, /kill <id> to stop.");
+      } else if (
+        // F2: /job spawns a full agent run, so it goes through the SAME strict
+        // burst breaker as every dedicated-group task (3 hits/30s, 2-min pause,
+        // per chat+provider lane). Without this, a looping automation echoing
+        // "/job …" would fill every job slot indefinitely — the runaway the
+        // breaker exists to stop. fromMe-only, matching the task path at line ~2952.
+        msg.key.fromMe &&
+        !allowTaskAttempt(remoteJid, "explicit", {
+          id: chat.provider,
+          label: agentReplyLabel(undefined, chat.provider),
+        })
+      ) {
+        return; // breaker tripped — its notice is sent once per pause window
+      } else {
+        // Group jobs use the chat's default provider and carry a CHAT-WIDE
+        // guard only (no laneId). Authorization is the group's existing gate.
+        const chatKey = canonicalChatKey(remoteJid);
+        const jobModel = config.modelFor(chat.provider);
+        const note = safeJobNote(arg.slice(0, 60));
+        const spawned = await jobRunner.spawn({
+          remoteJid,
+          chatKey,
+          sourceLabel: agentReplyLabel(undefined, chat.provider),
+          provider: chat.provider,
+          ...(jobModel ? { model: jobModel } : {}),
+          cwd: chat.cwd,
+          task: arg,
+          note,
+          origin: "command",
+          guard: { chatKey, generation: chat.generation },
+        });
+        await bridgeReply(
+          spawned.ok
+            ? `🚀 Job ${spawned.id} started — ${note}. /jobs to check, /kill ${spawned.id} to stop.`
+            : `⚠️ Couldn't start job: ${spawned.reason}.`,
+        );
+      }
     } else if (cmd === "stop") {
       // F8: helpful notice instead of the old "Unknown command" fall-through.
       await bridgeReply(
@@ -2631,7 +2954,9 @@ async function handleIncomingInner(
           "so /chat is not needed here. It only applies to ordinary chats.",
       );
     } else {
-      await bridgeReply("Unknown command. Available: /new  /cd <path>  /use <provider>  /status");
+      await bridgeReply(
+        "Unknown command. Available: /new  /cd <path>  /use <provider>  /status  /jobs  /kill <id>  /job <task>",
+      );
     }
     return;
   }
@@ -2760,6 +3085,10 @@ async function handleIncomingInner(
   // Per-task private outbox: concurrent tasks sharing a workdir must never
   // sweep each other's in-flight files.
   const taskOutbox = join(outboxRoot, `task-${randomUUID().slice(0, 8)}`);
+  // Delegation drop-dir: a SIBLING of taskOutbox (so the outbox flush never
+  // ships job-request JSON to WhatsApp), still under outboxRoot so
+  // isolateOrphans (loose FILES only) never touches it.
+  const taskJobsDir = join(outboxRoot, basename(taskOutbox) + "-jobs");
   const warn = chat.pendingWarn;
   chat.pendingWarn = undefined;
 
@@ -2782,7 +3111,19 @@ async function handleIncomingInner(
     }
   }
   if (stale()) return;
-  await taskBridgeReply("🤖 On it...");
+  // Dispatch-time ack (ephemeral, agent-labeled, no position info). Recovered
+  // turns get the ▶️ variant. Fire-and-forget, no longer durable-queued — a
+  // "(delayed) 🤖 On it..." after a reconnect was pure noise; the label also
+  // identifies WHICH agent when two lanes run in one chat.
+  if (config.ackEnabled) {
+    void safeSend(
+      remoteJid,
+      recovered
+        ? prefixReply("Bridge", "▶️ Resuming a saved turn from before the restart…")
+        : prefixReply(sourceLabel, "🤖 On it…"),
+      { guard, ephemeral: true },
+    );
+  }
   if (stale()) return;
 
   // ── Compose the task: caption + file note + outbox capability ──────
@@ -2817,6 +3158,7 @@ async function handleIncomingInner(
   }
   if (stale()) return;
   task += `\n\n[To send a file back to the user on WhatsApp, save it into ${taskOutbox} — it will be delivered and removed automatically. Do not mention this folder unless relevant.]`;
+  task += `\n[Long work: this chat expects a reply within about a minute. For anything longer (builds, full test suites, big refactors, research sweeps), do NOT do it inline — write one JSON file per job into ${taskJobsDir} shaped {"task":"<complete, self-contained instructions with all needed context and paths>","note":"<short label>"} and reply immediately saying what you delegated. Each file becomes a background job in this same working directory; its result will be posted to this chat when done. The job runs with a FRESH agent session — include everything it needs inside "task".]`;
 
   // Quarantine legacy loose files in the shared outbox root (per-task subdirs
   // are never touched). Skipped while another chat has a task running in this
@@ -2836,6 +3178,11 @@ async function handleIncomingInner(
     preview: (body || attachment?.filename || "").replace(/\s+/g, " ").slice(0, 200),
     provider: provider.name,
   });
+  const reporter = new ProgressReporter(
+    (text) => safeSend(remoteJid, prefixReply(sourceLabel, text), { guard, ephemeral: true }),
+    config.progressIntervalMs,
+    config.progressMaxUpdates,
+  );
 
   try {
     if (stale()) {
@@ -2844,12 +3191,18 @@ async function handleIncomingInner(
       return;
     }
     mkdirSync(taskOutbox, { recursive: true });
+    mkdirSync(taskJobsDir, { recursive: true });
     const res = await provider.run(
       task,
       {
         cwd: taskCwd,
         resumeSessionId: sessionAtDispatch,
         model: matched?.model ?? config.modelFor(provider.name),
+        // Only wire progress when the rail is on: at 0, passing no onProgress
+        // keeps claude's argv in json mode (the production kill-switch).
+        ...(config.progressIntervalMs > 0
+          ? { onProgress: (ev: ProgressEvent) => { if (!stale()) reporter.push(ev); } }
+          : {}),
       },
       config.taskTimeoutMs,
     );
@@ -2884,7 +3237,34 @@ async function handleIncomingInner(
         "⚠️ " + res.text + (held ? "\n📎 Files it was writing were held (not sent) — see outbox/.orphaned/." : ""),
       );
     } else {
-      const replyText = (res.isError ? "⚠️ " : "") + res.text;
+      let replyText = (res.isError ? "⚠️ " : "") + res.text;
+      // Delegation: consume any job-request files this turn's agent dropped and
+      // spawn them as background jobs in the SAME workdir, inheriting the turn's
+      // full lane guard. ONLY on a SUCCESSFUL turn — an errored/aborted turn's
+      // files are still consumed (finally rmSync) but spawn NOTHING. Append one
+      // status line per request to the reply.
+      if (!res.isError) {
+        const swept = sweepJobRequests(taskJobsDir);
+        for (const request of swept.requests) {
+          const jobModel = matched?.model ?? config.modelFor(provider.name);
+          const spawned = await jobRunner.spawn({
+            remoteJid,
+            chatKey: guard.chatKey,
+            sourceLabel,
+            provider: provider.name,
+            ...(jobModel ? { model: jobModel } : {}),
+            cwd: taskCwd,
+            task: request.task,
+            note: safeJobNote(request.note),
+            origin: "delegated",
+            guard,
+          });
+          replyText += spawned.ok
+            ? `\n🚀 Started job ${spawned.id} — ${safeJobNote(request.note)}`
+            : `\n⚠️ Job file ignored: ${spawned.reason}`;
+        }
+        for (const err of swept.errors) replyText += `\n⚠️ Job file ignored: ${err}`;
+      }
       const sent = await taskAgentReply(replyText);
       if (!sent.delivered || stale()) {
         orphanTaskOutbox(taskOutbox, outboxRoot);
@@ -2899,21 +3279,14 @@ async function handleIncomingInner(
         sent,
       );
       // ── Deliver any files the agent left in ITS outbox (current socket) ──
-      const liveSock = currentSock;
-      if (liveSock) {
-        const delivered = await flushOutbox(
-          liveSock,
-          remoteJid,
-          taskOutbox,
-          rememberSent,
-          () => !stale(),
-        );
-        if (!stale()) removeTaskOutbox(taskOutbox);
-        else orphanTaskOutbox(taskOutbox, outboxRoot);
-        if (delivered) await taskBridgeReply(delivered.summary);
-      } else {
-        orphanTaskOutbox(taskOutbox, outboxRoot); // can't deliver now — hold, don't leak
-      }
+      await deliverTaskOutbox({
+        remoteJid,
+        guard,
+        taskOutbox,
+        outboxRoot,
+        mode: "group",
+        bridgeReply: taskBridgeReply,
+      });
     }
   } catch (e: any) {
     log.error(`[${remoteJid}] bridge error: ${e?.message ?? e}`);
@@ -2922,6 +3295,9 @@ async function handleIncomingInner(
     if (!stale()) await taskBridgeReply(`💥 ${e?.message ?? e}`);
     else taskFinished(rec, { status: "cancelled" });
   } finally {
+    reporter.stop();
+    // Consume the delegation drop-dir on every path (see the mention closure).
+    rmSync(taskJobsDir, { recursive: true, force: true });
     cwdTaskFinished(taskCwd);
     await currentSock?.sendPresenceUpdate("paused", remoteJid).catch(() => {});
   }
